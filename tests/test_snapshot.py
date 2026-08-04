@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import snapshot
+from risk import OrderRequest, validate, portfolio_value
 
 
 # -- Fixtures -----------------------------------------------------------
@@ -74,7 +75,7 @@ def test_build_state_available_cash_resta_ordersforopen_y_orders():
     assert state["cashUsd"] == 825.0
 
 
-def test_build_state_valueusd_negativo_se_clampa_a_cero():
+def test_build_state_valueusd_negativo_no_se_clampa_y_reduce_total_de_sizing():
     pnl = {
         "clientPortfolio": {
             "credit": 100.0,
@@ -86,7 +87,10 @@ def test_build_state_valueusd_negativo_se_clampa_a_cero():
         }
     }
     state = snapshot.build_state("pf-1", pnl, {5: "SPY"})
-    assert state["positions"][0]["valueUsd"] == 0.0
+    assert state["positions"][0]["valueUsd"] == -490.0
+    # Integración con risk.py: el total de sizing refleja el pnl negativo real,
+    # no un valor clampado que sobreestime el portfolio.
+    assert portfolio_value(state) == 100.0 + (-490.0)
 
 
 def test_build_state_tolera_positionid_variantes_y_listas_ausentes():
@@ -102,6 +106,149 @@ def test_build_state_tolera_positionid_variantes_y_listas_ausentes():
     state = snapshot.build_state("pf-1", pnl, {1: "SPY"})
     assert state["cashUsd"] == 500.0
     assert state["positions"][0]["positionId"] == 3
+
+
+# -- build_state: fail-closed sin defaults silenciosos (fix #2) -------------
+
+
+def test_build_state_sin_clientportfolio_lanza_valueerror():
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", {}, {})
+
+
+def test_build_state_clientportfolio_sin_credit_lanza_valueerror():
+    pnl = {"clientPortfolio": {"positions": []}}
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {})
+
+
+def test_build_state_credit_no_numerico_lanza_valueerror():
+    pnl = {"clientPortfolio": {"credit": "un montón", "positions": []}}
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {})
+
+
+def test_build_state_credit_bool_lanza_valueerror():
+    pnl = {"clientPortfolio": {"credit": True, "positions": []}}
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {})
+
+
+def test_build_state_credit_none_lanza_valueerror():
+    pnl = {"clientPortfolio": {"credit": None, "positions": []}}
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {})
+
+
+# -- build_state: positionId ausente (fix #7) --------------------------------
+
+
+def test_build_state_positionid_ausente_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [
+                {"instrumentID": 1, "amount": 10.0, "unrealizedPnL": 0.0},  # sin positionID/Id
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {1: "SPY"})
+
+
+def test_build_state_positionid_null_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [
+                {"positionID": None, "instrumentID": 1, "amount": 10.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {1: "SPY"})
+
+
+# -- build_state: mirrors no soportado (fix #8) ------------------------------
+
+
+def test_build_state_con_mirrors_poblado_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [],
+            "mirrors": [{"mirrorID": 42}],
+        }
+    }
+    with pytest.raises(ValueError, match="copy trading"):
+        snapshot.build_state("pf-1", pnl, {})
+
+
+def test_build_state_mirrors_vacio_o_ausente_no_falla():
+    pnl_sin_mirrors_key = {
+        "clientPortfolio": {"credit": 100.0, "positions": [], "orders": [], "ordersForOpen": []}
+    }
+    pnl_mirrors_vacio = {
+        "clientPortfolio": {
+            "credit": 100.0, "positions": [], "orders": [], "ordersForOpen": [], "mirrors": [],
+        }
+    }
+    snapshot.build_state("pf-1", pnl_sin_mirrors_key, {})
+    snapshot.build_state("pf-1", pnl_mirrors_vacio, {})
+
+
+# -- compute_equity: fórmula oficial (fix #1) --------------------------------
+
+
+def test_compute_equity_formula_oficial_con_ordenes_pendientes():
+    # Portfolio de 10000 con órdenes pendientes de ambos tipos: la equity real
+    # sigue siendo 10000, no debe caer solo porque hay órdenes en vuelo.
+    pnl = {
+        "clientPortfolio": {
+            "credit": 10000.0,
+            "positions": [],
+            "orders": [{"amount": 1500.0}],
+            "ordersForOpen": [{"amount": 2500.0, "mirrorID": 0}],
+        }
+    }
+    assert snapshot.compute_equity(pnl) == 10000.0
+
+
+def test_compute_equity_incluye_posiciones_abiertas_y_pnl_sin_clamp():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 700.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": 1, "amount": 100.0, "unrealizedPnL": -30.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    # availableCash=700, totalInvested=100, unrealizedPnL=-30 -> 700+100-30=770
+    assert snapshot.compute_equity(pnl) == 770.0
+
+
+def test_compute_equity_sin_clientportfolio_lanza_valueerror():
+    with pytest.raises(ValueError):
+        snapshot.compute_equity({})
+
+
+def test_compute_equity_sin_credit_lanza_valueerror():
+    with pytest.raises(ValueError):
+        snapshot.compute_equity({"clientPortfolio": {}})
+
+
+def test_compute_equity_con_mirrors_poblado_lanza_valueerror():
+    pnl = {"clientPortfolio": {"credit": 100.0, "mirrors": [{"mirrorID": 1}]}}
+    with pytest.raises(ValueError, match="copy trading"):
+        snapshot.compute_equity(pnl)
 
 
 # -- update_equity --------------------------------------------------------
@@ -122,6 +269,125 @@ def test_update_equity_appendea_dia_nuevo():
 def test_update_equity_lista_vacia():
     result = snapshot.update_equity([], "2026-08-01", 100.0)
     assert result == [("2026-08-01", 100.0)]
+
+
+def test_update_equity_ordena_filas_desordenadas_ascendente():
+    rows = [("2026-08-03", 300.0), ("2026-08-01", 100.0)]
+    result = snapshot.update_equity(rows, "2026-08-02", 200.0)
+    assert result == [
+        ("2026-08-01", 100.0),
+        ("2026-08-02", 200.0),
+        ("2026-08-03", 300.0),
+    ]
+
+
+# -- _resolve_symbol_by_id (fix #3) ------------------------------------------
+
+
+def _fake_client_with_metadata(metadata):
+    client = MagicMock()
+    client.get_instruments_metadata.return_value = metadata
+    return client
+
+
+def test_resolve_symbol_by_id_con_dict_items():
+    client = _fake_client_with_metadata(
+        {"items": [{"instrumentId": 1, "internalSymbolFull": "SPY"}]}
+    )
+    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+
+
+def test_resolve_symbol_by_id_con_lista_desnuda_no_rompe():
+    # Antes de este fix, metadata.get(...) sobre una lista lanzaba AttributeError
+    # antes de llegar al isinstance(metadata, list) — rama muerta.
+    client = _fake_client_with_metadata(
+        [{"instrumentId": 1, "internalSymbolFull": "SPY"}]
+    )
+    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+
+
+def test_resolve_symbol_by_id_instrumentid_string_numerico_tolerado():
+    client = _fake_client_with_metadata(
+        {"items": [{"instrumentId": "1", "internalSymbolFull": "SPY"}]}
+    )
+    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+
+
+def test_resolve_symbol_by_id_instrumentid_no_numerico_lanza_valueerror():
+    client = _fake_client_with_metadata(
+        {"items": [{"instrumentId": "no-es-un-id", "internalSymbolFull": "SPY"}]}
+    )
+    with pytest.raises(ValueError):
+        snapshot._resolve_symbol_by_id(client, [1])
+
+
+def test_resolve_symbol_by_id_duplicado_mismo_simbolo_se_queda_con_primero():
+    client = _fake_client_with_metadata(
+        {
+            "items": [
+                {"instrumentId": 1, "internalSymbolFull": "SPY"},
+                {"instrumentId": 1, "internalSymbolFull": "SPY"},
+            ]
+        }
+    )
+    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+
+
+def test_resolve_symbol_by_id_duplicado_simbolo_distinto_lanza_valueerror():
+    client = _fake_client_with_metadata(
+        {
+            "items": [
+                {"instrumentId": 1, "internalSymbolFull": "SPY"},
+                {"instrumentId": 1, "internalSymbolFull": "QQQ"},
+            ]
+        }
+    )
+    with pytest.raises(ValueError):
+        snapshot._resolve_symbol_by_id(client, [1])
+
+
+# -- _read_equity_rows: header inesperado (minor) ----------------------------
+
+
+def test_read_equity_rows_header_inesperado_lanza_valueerror(tmp_path):
+    path = tmp_path / "equity.csv"
+    path.write_text("fecha,valor\n2026-08-01,100.0\n")
+    with pytest.raises(ValueError):
+        snapshot._read_equity_rows(path)
+
+
+def test_read_equity_rows_header_correcto_ok(tmp_path):
+    path = tmp_path / "equity.csv"
+    path.write_text("date,total\n2026-08-01,100.0\n")
+    assert snapshot._read_equity_rows(path) == [("2026-08-01", 100.0)]
+
+
+def test_read_equity_rows_archivo_inexistente_devuelve_vacio(tmp_path):
+    path = tmp_path / "no-existe.csv"
+    assert snapshot._read_equity_rows(path) == []
+
+
+# -- Integración cripto: variante BTCUSD cuenta contra el tope (fix #4) ------
+
+
+def test_integracion_build_state_btcusd_bloquea_cripto_combinado():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 150.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": 1, "amount": 50.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {1: "BTCUSD"})
+    # cashUsd=150, posición BTCUSD valueUsd=50 -> total=200
+    order = OrderRequest(action="open", symbol="ETH", amount_usd=25.0, stop_loss_pct=0.05)
+    equity_rows = [("2026-08-01", 190.0), ("2026-08-02", 200.0)]
+    ok, msg = validate(order, state, equity_rows)
+    assert not ok
+    assert "cripto" in msg.lower()
 
 
 # -- main() -----------------------------------------------------------------
@@ -203,11 +469,43 @@ def test_main_ok_escribe_positions_y_equity(tmp_path, monkeypatch, capsys):
         rows = list(csv.reader(f))
     assert rows[0] == ["date", "total"]
     assert rows[1][0] == "2026-08-04"
+    # Sin órdenes pendientes en este fixture, equity oficial == cash + sum(valueUsd)
     total = 1000.0 + 105.0 + 190.0
     assert abs(float(rows[1][1]) - total) < 1e-9
 
     captured = capsys.readouterr()
     assert "OK" in captured.out
+
+
+def test_main_equity_csv_usa_formula_oficial_con_ordenes_pendientes(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+    monkeypatch.setattr(snapshot, "_today_str", lambda: "2026-08-04")
+
+    pnl = {
+        "clientPortfolio": {
+            "credit": 10000.0,
+            "positions": [],
+            "orders": [{"amount": 1500.0}],
+            "ordersForOpen": [{"amount": 2500.0, "mirrorID": 0}],
+        }
+    }
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.return_value = {
+        "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
+    }
+    fake_client.get_pnl.return_value = pnl
+    fake_client.get_instruments_metadata.return_value = {"items": []}
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    snapshot.main()
+
+    equity_path = state_dir / "equity.csv"
+    with open(equity_path) as f:
+        rows = list(csv.reader(f))
+    assert rows[1][0] == "2026-08-04"
+    assert abs(float(rows[1][1]) - 10000.0) < 1e-9
 
 
 def test_main_no_tmp_file_left_behind_on_success(tmp_path, monkeypatch):

@@ -23,7 +23,21 @@ MAX_POSITION_PCT = 0.25
 MAX_CRYPTO_PCT = 0.35
 MAX_STOP_LOSS_PCT = 0.12
 DEFENSIVE_DRAWDOWN_PCT = 0.25
-CRYPTO_SYMBOLS = {"BTC", "ETH"}
+
+# eToro puede devolver el símbolo de un instrumento cripto en distintos
+# formatos según el endpoint/instrumento (p.ej. "BTCUSD" en vez de "BTC" —
+# visto en la metadata de market-data/instruments). Si este set no cubre la
+# variante devuelta, el tope de MAX_CRYPTO_PCT se evalúa contra un conjunto
+# que no incluye esa posición y el límite falla ABIERTO (deja pasar
+# exposición cripto sin límite). Se listan las variantes conocidas
+# explícitamente en vez de un match parcial (p.ej. "BTC" in symbol), que
+# podría capturar falsos positivos (tickers no-cripto que contengan "BTC").
+CRYPTO_SYMBOLS = {
+    "BTC", "ETH",
+    "BTCUSD", "ETHUSD",
+    "BTC-USD", "ETH-USD",
+    "BTCEUR", "ETHEUR",
+}
 
 
 @dataclass

@@ -250,3 +250,28 @@ def test_bloquea_amount_bool():
 def test_bloquea_stop_loss_bool():
     ok, msg = validate(open_order(sl=True), STATE, EQUITY_OK)
     assert not ok
+
+
+# --- Fix quality review Task 4: variantes de símbolo cripto + valueUsd negativo ---
+
+
+def test_bloquea_cripto_btcusd_variante_sobre_35pct():
+    # eToro puede devolver "BTCUSD" en vez de "BTC" — debe seguir contando
+    # contra el tope de 35% cripto combinado, no pasar desapercibido.
+    state = {
+        "cashUsd": 100.0,
+        "positions": [
+            {"symbol": "BTCUSD", "valueUsd": 40.0},
+            {"symbol": "SPY", "valueUsd": 60.0},
+        ],
+    }  # total 200
+    ok, msg = validate(open_order(symbol="ETH", amount=35.0), state, EQUITY_OK)
+    assert not ok and "cripto" in msg.lower()
+
+
+def test_valueusd_negativo_finito_es_aceptado_por_portfolio_value():
+    # valueUsd negativo (posición con pnl muy negativo, posible con
+    # apalancamiento) no debe rechazarse como "malformado" — reduce el total
+    # de sizing en vez de ser clampado u omitido.
+    state = {"cashUsd": 100.0, "positions": [{"symbol": "SPY", "valueUsd": -50.0}]}
+    assert portfolio_value(state) == 50.0
