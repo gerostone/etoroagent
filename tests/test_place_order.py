@@ -261,23 +261,44 @@ def test_open_simbolo_fuera_de_universo_bloquea(tmp_path, monkeypatch):
 
 
 def test_open_amount_mayor_a_cash_bloquea(tmp_path, monkeypatch):
+    """Aísla el guard de cash de la regla del 25% de risk.validate: el total
+    del portfolio es grande (1000) y la orden (100) queda holgadamente DENTRO
+    del 25% (10%), pero el cash disponible (50) no alcanza para cubrirla. Si
+    este escenario también fuera bloqueado por risk.validate (p.ej. por
+    exceder el 25%), el test pasaría igual con el guard de cash comentado —
+    lo cual NO probaría que el guard funciona. Las posiciones existentes
+    (SPY 250 + XLK 250 + XLE 250 + XLF 200 = 950) están todas <=25% del total
+    y cubren distintos símbolos del universo para no interferir con el
+    símbolo de la orden (QQQ, sin posición previa)."""
     monkeypatch.setenv("DRY_RUN", "0")
     state = {
         "updatedAt": "x",
         "portfolioId": "pf-1",
-        "cashUsd": 10.0,
-        "positions": [],
+        "cashUsd": 50.0,
+        "positions": [
+            {"positionId": "p-spy", "symbol": "SPY", "instrumentId": 1, "valueUsd": 250.0},
+            {"positionId": "p-xlk", "symbol": "XLK", "instrumentId": 2, "valueUsd": 250.0},
+            {"positionId": "p-xle", "symbol": "XLE", "instrumentId": 3, "valueUsd": 250.0},
+            {"positionId": "p-xlf", "symbol": "XLF", "instrumentId": 4, "valueUsd": 200.0},
+        ],
     }
-    write_state(tmp_path, state, [("2026-08-01", 10.0)])
+    # total = 50 (cash) + 250+250+250+200 (posiciones) = 1000
+    write_state(tmp_path, state, [("2026-08-01", 1000.0)])
     client = MagicMock()
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        # QQQ sin posición previa: (0+100)/1000 = 10% <= 25% -> risk.validate
+        # NO bloquea esto por sí solo. cash disponible = 50 < 100 -> el guard
+        # de cash es el único que puede bloquear este escenario.
+        ["open", "--symbol", "QQQ", "--amount", "100", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
     assert rc == 2
     client.search_instrument.assert_not_called()
     client.open_position_by_amount.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "BLOQUEADA" in journal
+    assert "cash" in journal.lower()
 
 
 # -- 9: close con position-id inexistente ------------------------------------
@@ -301,11 +322,18 @@ def test_close_position_id_inexistente_bloquea(tmp_path, monkeypatch):
 
 def test_state_ausente_devuelve_rc_1(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = tmp_path / "state"
+    assert not state_dir.exists()  # nunca corrió snapshot.py
     client = MagicMock()
     rc = place_order.main(
         ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
-        state_dir=tmp_path / "state",
+        state_dir=state_dir,
         make_client=lambda: client,
     )
     assert rc == 1
     client.search_instrument.assert_not_called()
+    # journal() crea state_dir aunque nunca haya existido (no hubo snapshot):
+    # el intento de orden bloqueado queda igual como rastro de auditoría.
+    journal = (state_dir / "journal.md").read_text()
+    assert "ERROR" in journal
+    assert "state" in journal.lower()

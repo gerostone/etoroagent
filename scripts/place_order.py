@@ -105,9 +105,13 @@ def load_state(state_dir: Path) -> tuple:
 
 
 def journal(state_dir: Path, line: str) -> None:
-    """Appendea una línea al journal con timestamp UTC. Crea state_dir/journal.md
-    si no existen (solo se llama cuando ya sabemos que state_dir es válido,
-    p.ej. porque load_state() ya leyó archivos de ahí)."""
+    """Appendea una línea al journal con timestamp UTC. Crea state_dir y
+    state_dir/journal.md si no existen — incluido el caso en que state_dir
+    nunca existió (p.ej. nunca corrió snapshot.py): dejar rastro en el
+    journal de un intento de orden bloqueado por falta de state vale más que
+    la pureza de no tocar el filesystem. Puede lanzar OSError si ni siquiera
+    esto se puede escribir (permisos, disco lleno) — el caller decide si
+    eso también es fatal o si el mensaje en stderr ya alcanza."""
     state_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
     with open(state_dir / JOURNAL_FILE, "a") as f:
@@ -337,11 +341,18 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
         state, equity_rows = load_state(state_dir)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        # Si state_dir ni siquiera existe, no hubo snapshot alguna vez: no
-        # creamos el directorio solo para journalear (stderr alcanza). Si
-        # existe pero los archivos están corruptos/faltan, sí journaleamos.
-        if state_dir.exists():
+        # Journaleamos igual aunque state_dir no exista todavía (no hubo
+        # snapshot nunca): journal() crea el directorio si hace falta. Dejar
+        # rastro de "se intentó operar sin snapshot" vale más que la pureza
+        # de no tocar el filesystem — el intento de orden bloqueado es en sí
+        # mismo información de auditoría, y state/ ya no es un directorio
+        # sagrado (place_order.py también lo crea vía journal en cualquier
+        # otro flujo). Si por lo que sea ni siquiera esto se puede escribir
+        # (permisos, disco lleno), stderr ya quedó impreso arriba.
+        try:
             journal(state_dir, f"ERROR | no se pudo cargar el state: {exc}")
+        except OSError as journal_exc:
+            print(f"ERROR: no se pudo journalear tampoco: {journal_exc}", file=sys.stderr)
         return 1
 
     if args.action == "open":
