@@ -65,14 +65,20 @@ def test_build_state_available_cash_resta_ordersforopen_y_orders():
             "positions": [],
             "orders": [{"amount": 50.0}, {"amount": 25.0}],
             "ordersForOpen": [
-                {"amount": 100.0, "mirrorID": 0},
+                {"amount": 100.0, "mirrorID": 0, "instrumentID": 9},
                 {"amount": 999.0, "mirrorID": 7},  # debe ignorarse (mirrorID != 0)
             ],
         }
     }
-    state = snapshot.build_state("pf-1", pnl, {})
+    state = snapshot.build_state("pf-1", pnl, {9: "SPY"})
     # 1000 - 100 (ordersForOpen mirrorID=0) - (50+25) (orders) = 825
     assert state["cashUsd"] == 825.0
+    # La orden pendiente (mirrorID=0) entra a positions[] como sintética;
+    # la ignorada (mirrorID=7) no genera ninguna entrada.
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["symbol"] == "SPY"
+    assert state["positions"][0]["valueUsd"] == 100.0
+    assert state["positions"][0]["pending"] is True
 
 
 def test_build_state_valueusd_negativo_no_se_clampa_y_reduce_total_de_sizing():
@@ -106,6 +112,212 @@ def test_build_state_tolera_positionid_variantes_y_listas_ausentes():
     state = snapshot.build_state("pf-1", pnl, {1: "SPY"})
     assert state["cashUsd"] == 500.0
     assert state["positions"][0]["positionId"] == 3
+
+
+# -- build_state: aperturas pendientes cuentan como exposición (2da ronda, fix #1) --
+
+
+def test_build_state_ordenes_pendientes_generan_posicion_sintetica():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 10000.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [
+                {"amount": 2400.0, "mirrorID": 0, "instrumentID": 3},
+            ],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {3: "BTC"})
+    assert state["cashUsd"] == 7600.0  # 10000 - 2400
+    assert len(state["positions"]) == 1
+    pending = state["positions"][0]
+    assert pending["symbol"] == "BTC"
+    assert pending["instrumentId"] == 3
+    assert pending["valueUsd"] == 2400.0
+    assert pending["pending"] is True
+    assert str(pending["positionId"]).startswith("pending-open:")
+
+
+def test_build_state_orden_pendiente_ignorada_por_mirrorid_no_genera_posicion():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 1000.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [
+                {"amount": 500.0, "mirrorID": 7, "instrumentID": 3},  # copiada: se ignora
+            ],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {3: "BTC"})
+    assert state["positions"] == []
+    assert state["cashUsd"] == 1000.0
+
+
+def test_build_state_cierre_pendiente_no_genera_posicion_sintetica_duplicada():
+    # orders[] (cierres pendientes de posiciones YA abiertas) no debe agregar
+    # una entrada nueva a positions[] — la posición subyacente ya está ahí.
+    pnl = {
+        "clientPortfolio": {
+            "credit": 500.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": 1, "amount": 100.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [
+                {"amount": 100.0, "instrumentID": 1},
+            ],
+            "ordersForOpen": [],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {1: "SPY"})
+    assert len(state["positions"]) == 1
+
+
+def test_ordenes_pendientes_visibles_para_risk_bloquean_exposicion_excesiva():
+    # Escenario reportado en el review: equity 10000, orden BTC pendiente de
+    # apertura por 2400. Antes de este fix, risk.py no veía esa exposición y
+    # permitía abrir 1800 USD más de BTC (exposición real resultante 42%,
+    # muy por encima del tope del 25% por posición).
+    pnl = {
+        "clientPortfolio": {
+            "credit": 10000.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [
+                {"amount": 2400.0, "mirrorID": 0, "instrumentID": 3},
+            ],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {3: "BTC"})
+    order = OrderRequest(action="open", symbol="BTC", amount_usd=1800.0, stop_loss_pct=0.05)
+    equity_rows = [("2026-08-01", 9500.0), ("2026-08-02", 10000.0)]
+    ok, msg = validate(order, state, equity_rows)
+    assert not ok
+    assert "25%" in msg
+
+
+# -- build_state: universo cerrado de símbolos (2da ronda, fix #2) ----------
+
+
+def test_build_state_simbolo_fuera_del_universo_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": 1, "amount": 10.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError, match="universo"):
+        snapshot.build_state("pf-1", pnl, {1: "AAPL"})  # AAPL no está en risk.UNIVERSE
+
+
+def test_build_state_orden_pendiente_simbolo_fuera_del_universo_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [{"amount": 50.0, "mirrorID": 0, "instrumentID": 2}],
+        }
+    }
+    with pytest.raises(ValueError, match="universo"):
+        snapshot.build_state("pf-1", pnl, {2: "TSLA"})
+
+
+# -- build_state: normalización de instrumentID en positions/ordersForOpen (fix #3) --
+
+
+def test_build_state_instrumentid_string_numerico_en_posicion_se_normaliza():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 500.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": "1", "amount": 10.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {1: "SPY"})  # symbol_by_id con int 1
+    assert state["positions"][0]["symbol"] == "SPY"
+    assert state["positions"][0]["instrumentId"] == 1
+
+
+def test_build_state_instrumentid_string_numerico_en_orden_pendiente_se_normaliza():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 500.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [{"amount": 50.0, "mirrorID": 0, "instrumentID": "3"}],
+        }
+    }
+    state = snapshot.build_state("pf-1", pnl, {3: "BTC"})
+    assert state["positions"][0]["symbol"] == "BTC"
+    assert state["positions"][0]["instrumentId"] == 3
+
+
+def test_build_state_instrumentid_no_numerico_en_posicion_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 500.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": "no-es-un-id", "amount": 10.0, "unrealizedPnL": 0.0},
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {1: "SPY"})
+
+
+# -- build_state: amount requerido, sin default silencioso (fix #4) ---------
+
+
+def test_build_state_amount_ausente_en_posicion_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [
+                {"positionID": 1, "instrumentID": 1, "unrealizedPnL": 0.0},  # sin amount
+            ],
+            "orders": [],
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {1: "SPY"})
+
+
+def test_build_state_amount_ausente_en_ordersforopen_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [],
+            "orders": [],
+            "ordersForOpen": [{"mirrorID": 0, "instrumentID": 1}],  # sin amount
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {1: "SPY"})
+
+
+def test_build_state_amount_ausente_en_orders_lanza_valueerror():
+    pnl = {
+        "clientPortfolio": {
+            "credit": 100.0,
+            "positions": [],
+            "orders": [{}],  # sin amount
+            "ordersForOpen": [],
+        }
+    }
+    with pytest.raises(ValueError):
+        snapshot.build_state("pf-1", pnl, {})
 
 
 # -- build_state: fail-closed sin defaults silenciosos (fix #2) -------------
@@ -488,7 +700,7 @@ def test_main_equity_csv_usa_formula_oficial_con_ordenes_pendientes(tmp_path, mo
             "credit": 10000.0,
             "positions": [],
             "orders": [{"amount": 1500.0}],
-            "ordersForOpen": [{"amount": 2500.0, "mirrorID": 0}],
+            "ordersForOpen": [{"amount": 2500.0, "mirrorID": 0, "instrumentID": 7}],
         }
     }
     fake_client = MagicMock()
@@ -496,7 +708,9 @@ def test_main_equity_csv_usa_formula_oficial_con_ordenes_pendientes(tmp_path, mo
         "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
     }
     fake_client.get_pnl.return_value = pnl
-    fake_client.get_instruments_metadata.return_value = {"items": []}
+    fake_client.get_instruments_metadata.return_value = {
+        "items": [{"instrumentId": 7, "internalSymbolFull": "SPY"}]
+    }
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()

@@ -39,6 +39,18 @@ CRYPTO_SYMBOLS = {
     "BTCEUR", "ETHEUR",
 }
 
+# Universo cerrado de símbolos operables. Clasificar cripto por igualdad
+# exacta contra CRYPTO_SYMBOLS (o cualquier otra pertenencia a un set fijo)
+# falla ABIERTO ante un formato no listado: un símbolo desconocido no entra
+# en ningún set y por lo tanto no cuenta contra NINGÚN tope (ni posición ni
+# cripto). Por eso validate() rechaza cualquier símbolo que no esté en este
+# universo cerrado, en vez de asumir que "no está en CRYPTO_SYMBOLS" implica
+# "es equity y está permitido".
+UNIVERSE_EQUITY = {
+    "SPY", "QQQ", "XLK", "XLE", "XLF", "XLV", "XLI", "XLP", "XLU", "GLD", "TLT",
+}
+UNIVERSE = UNIVERSE_EQUITY | CRYPTO_SYMBOLS
+
 
 @dataclass
 class OrderRequest:
@@ -162,6 +174,12 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
     symbol = _norm_symbol(order.symbol)
     if not symbol:
         return False, "Símbolo de orden inválido."
+
+    if symbol not in UNIVERSE:
+        return False, (
+            f"Símbolo {symbol} fuera del universo operable — actualizar "
+            "mapeo/universo antes de continuar."
+        )
 
     if not _is_finite_number(order.amount_usd) or order.amount_usd <= 0:
         return False, "Monto inválido."

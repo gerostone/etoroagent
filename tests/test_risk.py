@@ -275,3 +275,21 @@ def test_valueusd_negativo_finito_es_aceptado_por_portfolio_value():
     # de sizing en vez de ser clampado u omitido.
     state = {"cashUsd": 100.0, "positions": [{"symbol": "SPY", "valueUsd": -50.0}]}
     assert portfolio_value(state) == 50.0
+
+
+# --- Fix quality review Task 4 (2da ronda): universo cerrado de símbolos ---
+
+
+def test_bloquea_simbolo_fuera_del_universo_operable():
+    # Un símbolo no listado (ni equity conocido ni variante cripto conocida)
+    # no debe colarse: clasificar por pertenencia a un set fijo falla abierto
+    # ante cualquier formato no anticipado si no hay un universo cerrado.
+    ok, msg = validate(open_order(symbol="AAPL"), STATE, EQUITY_OK)
+    assert not ok and "universo" in msg.lower()
+
+
+def test_permite_simbolos_del_universo_equity_y_cripto():
+    ok, msg = validate(open_order(symbol="QQQ", amount=10.0), STATE, EQUITY_OK)
+    assert ok, msg
+    ok2, msg2 = validate(open_order(symbol="BTC", amount=10.0), STATE, EQUITY_OK)
+    assert ok2, msg2
