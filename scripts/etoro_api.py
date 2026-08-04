@@ -15,16 +15,35 @@ import requests
 BASE_URL = "https://public-api.etoro.com"
 DEFAULT_TIMEOUT = 30
 RETRY_BACKOFF_SECONDS = [15, 30, 60]
+MAX_RETRY_AFTER_SECONDS = 60
 
 
 class EtoroAuthError(Exception):
     """401 de la API: credenciales inválidas. No tiene sentido reintentar."""
 
 
+class EtoroUnknownOutcomeError(Exception):
+    """Respuesta 2xx cuyo body no es JSON parseable (ej. WAF/proxy intermedio).
+
+    Esto NO prueba que la orden haya fallado: un POST de apertura/cierre pudo
+    haberse ejecutado igual del lado de eToro pese a este error del lado
+    cliente. Ver el docstring de EtoroClient.request() para la política de
+    no-reintento ante este y otros errores en POSTs de trading.
+    """
+
+
 class EtoroClient:
     def __init__(self, api_key=None, user_key=None):
         self.api_key = api_key or os.environ.get("ETORO_API_KEY")
         self.user_key = user_key or os.environ.get("ETORO_USER_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "falta ETORO_API_KEY: pasalo como api_key= o definí la variable de entorno ETORO_API_KEY"
+            )
+        if not self.user_key:
+            raise ValueError(
+                "falta ETORO_USER_KEY: pasalo como user_key= o definí la variable de entorno ETORO_USER_KEY"
+            )
 
     def _headers(self):
         return {
@@ -38,10 +57,22 @@ class EtoroClient:
         """Ejecuta un request HTTP con auth, backoff en 429 y manejo de errores.
 
         401 -> EtoroAuthError (terminal, no reintenta).
-        429 -> espera Retry-After (o backoff 15/30/60s) y reintenta hasta
-               max_retries veces; si persiste, RuntimeError.
-        otros 4xx/5xx -> raise_for_status().
+        429 -> espera Retry-After (capado a MAX_RETRY_AFTER_SECONDS=60s; si no
+               es un número parseable —p.ej. viene como HTTP-date RFC 7231—
+               cae al backoff fijo 15/30/60s) y reintenta hasta max_retries
+               veces; si persiste, RuntimeError.
+        otros 4xx/5xx -> raise_for_status() (nunca reintentado acá).
+        2xx con body no-JSON (WAF/proxy intermedio) -> EtoroUnknownOutcomeError.
         Devuelve el body parseado como JSON (o {} si no hay body).
+
+        IMPORTANTE para callers de POSTs de trading (abrir/cerrar posición):
+        este método NUNCA reintenta un POST ante un error (HTTPError,
+        ConnectionError, Timeout, EtoroUnknownOutcomeError, etc.) — un error
+        acá no prueba que la orden no se haya ejecutado del lado de eToro.
+        El caller tampoco debe reintentar a ciegas: ante duda, re-leer
+        GET /api/v1/trading/info/real/pnl (cache 60s) para verificar el
+        estado real del portfolio antes de asumir que la orden falló o de
+        disparar una orden equivalente de nuevo.
         """
         url = f"{BASE_URL}{path}"
         attempt = 0
@@ -58,19 +89,35 @@ class EtoroClient:
                     raise RuntimeError(
                         f"rate limit persistente tras {max_retries} reintentos ({method} {path})"
                     )
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after is not None:
-                    wait = float(retry_after)
-                else:
-                    wait = RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
-                time.sleep(wait)
+                time.sleep(self._retry_wait(resp.headers.get("Retry-After"), attempt))
                 attempt += 1
                 continue
 
             resp.raise_for_status()
             if not resp.content:
                 return {}
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as exc:
+                raise EtoroUnknownOutcomeError(
+                    f"respuesta 2xx con body no-JSON en {method} {path}: {exc}"
+                ) from exc
+
+    @staticmethod
+    def _retry_wait(retry_after, attempt):
+        """Segundos a esperar ante un 429.
+
+        Retry-After (si es un número) se capa a MAX_RETRY_AFTER_SECONDS para
+        no dejar el proceso dormido horas por un valor absurdo del servidor.
+        Si Retry-After no es parseable como número (ej. HTTP-date), cae al
+        backoff fijo 15/30/60s según el intento.
+        """
+        if retry_after is not None:
+            try:
+                return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+            except (TypeError, ValueError):
+                pass
+        return RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)]
 
     # -- Portfolio / info --------------------------------------------------
 
@@ -100,8 +147,13 @@ class EtoroClient:
             params={"instrumentIds": ",".join(str(i) for i in instrument_ids)},
         )
 
-    def get_candles(self, instrument_id, direction="desc", interval="OneDay", count=210):
-        """GET .../instruments/{id}/history/candles/{direction}/{interval}/{count}."""
+    def get_candles(self, instrument_id, *, direction="desc", interval="OneDay", count):
+        """GET .../instruments/{id}/history/candles/{direction}/{interval}/{count}.
+
+        count es requerido: cuántas velas pedir es una decisión de estrategia
+        del caller (snapshot.py/place_order.py), no un default de negocio que
+        deba vivir en el cliente HTTP.
+        """
         return self.request(
             "GET",
             f"/api/v1/market-data/instruments/{instrument_id}/history/candles/"
