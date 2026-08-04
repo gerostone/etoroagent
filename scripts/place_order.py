@@ -21,12 +21,42 @@ siempre, sin excepción:
      (docs/api-notes.md). Se calcula a partir del cierre de la última vela
      diaria: stop_loss_rate = round(precio * (1 - stop_loss_pct), 4). Si no
      se puede obtener el precio, no se abre la posición (exit 1).
-  5. No se cierran posiciones sintéticas ("pending-open:..."): son órdenes
-     pendientes, no posiciones abiertas — bloqueado con exit 2.
+  5. No se cierran posiciones sintéticas/pendientes ("pending-open:..." de
+     snapshot.py, o "local-open:..." de este mismo script — ver regla 8): son
+     órdenes pendientes o exposición todavía no confirmada, no posiciones
+     reales cerrables — bloqueado con exit 2.
   6. Guard de cash: para abrir, amount > cashUsd del state bloquea con exit 2
      (aunque el % de portfolio diera OK, no hay cash real disponible).
   7. Exit codes: 0 = ejecutada u OK en dry-run | 2 = bloqueada (riesgo o
      validación) | 1 = error de ejecución (incluye resultado ambiguo).
+  8. Registro de exposición intra-corrida: tras un open EXITOSO o de
+     resultado AMBIGUO (asumido ejecutado, fail-closed) se reescribe
+     state/positions.json atómicamente, agregando una posición sintética
+     {"positionId": "local-open:<uuid4>", "symbol", "instrumentId",
+     "valueUsd": amount, "pending": true} y restando amount de cashUsd.
+     get_pnl() cachea 60s del lado de eToro: sin este registro, una segunda
+     orden en la misma corrida (antes del próximo snapshot) leería un state
+     desactualizado y podría pasar los topes de riesgo (25% posición, 35%
+     cripto) muy por encima de lo real. Tras un close NO se toca el state
+     (la posición sigue ahí hasta el próximo snapshot — a propósito, es
+     conservador: borrarla relajaría el cálculo de drawdown).
+  9. El precio de la vela usado para el stop-loss se valida: finito y > 0
+     (si no, exit 1 sin abrir). Además se exige frescura: la vela no puede
+     tener más de 5 días de antigüedad según su 'fromDate' (tolerancia para
+     fines de semana largos); si 'fromDate' falta o no parsea, también
+     exit 1 sin abrir.
+  10. Frescura del state: si positions.json.updatedAt tiene más de 24h (o
+      falta/no parsea), se bloquea con exit 2 — correr snapshot.py primero.
+      Aplica tanto a open como a close.
+  11. Al cerrar, --symbol debe coincidir (normalizado a upper) con el symbol
+      real de la posición en el state — mismatch bloquea (exit 2) sin llamar
+      a la API.
+  12. Cualquier crash al crear el cliente HTTP (credenciales faltantes,
+      etc.) se journalea como ERROR y termina en exit 1 — nunca un
+      traceback pelado.
+  13. Si search_instrument devuelve más de un match exacto para el mismo
+      símbolo, se bloquea (exit 1) en vez de tomar el primero silenciosamente
+      — una ambigüedad de instrumentId no se resuelve arbitrariamente.
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp UTC y la razón pasada por --reason.
@@ -34,9 +64,11 @@ state/journal.md con timestamp UTC y la razón pasada por --reason.
 import argparse
 import csv
 import json
+import math
 import os
 import sys
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -47,6 +79,16 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 POSITIONS_FILE = "positions.json"
 EQUITY_FILE = "equity.csv"
 JOURNAL_FILE = "journal.md"
+
+CANDLE_MAX_AGE_DAYS = 5
+STATE_MAX_AGE_HOURS = 24
+
+# Prefijos de positionId que identifican posiciones sintéticas/no confirmadas
+# (no existen como posición real y cerrable del lado de eToro):
+#   "pending-open:"  -> aperturas pendientes vistas por snapshot.py (ver su docstring).
+#   "local-open:"     -> exposición registrada localmente por este script tras un
+#                         open exitoso o ambiguo (ver regla 8), hasta el próximo snapshot.
+SYNTHETIC_POSITION_PREFIXES = ("pending-open:", "local-open:")
 
 
 # -- State / journal (I/O puro y fino) -------------------------------------
@@ -118,6 +160,100 @@ def journal(state_dir: Path, line: str) -> None:
         f.write(f"- {timestamp} {line}\n")
 
 
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Mismo patrón que snapshot.py: tmp + os.replace para que un crash a
+    mitad de escritura nunca deje positions.json truncado/corrupto."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _register_local_exposure(
+    state_dir: Path, state: dict, symbol: str, instrument_id, amount: float
+) -> str:
+    """Regla de negocio 8: tras un open EXITOSO o de resultado AMBIGUO
+    (asumido ejecutado, fail-closed), registra la exposición localmente en
+    positions.json — agrega una posición sintética y resta amount de
+    cashUsd. Devuelve el positionId sintético generado.
+
+    No toca 'updatedAt': ese campo refleja la frescura del último snapshot
+    REAL contra eToro (regla 10) — un registro local no es un snapshot, y
+    envejecer 'updatedAt' artificialmente ocultaría que la data real de
+    eToro puede seguir sin refrescar.
+
+    La entrada generada usa el mismo shape que las posiciones sintéticas de
+    snapshot.py ({"pending": true}) para que risk.validate() y el guard de
+    posiciones sintéticas en _handle_close() las traten igual sin lógica
+    adicional."""
+    position_id = f"local-open:{uuid.uuid4()}"
+    new_state = dict(state)
+    new_state["positions"] = list(state.get("positions", [])) + [
+        {
+            "positionId": position_id,
+            "symbol": symbol,
+            "instrumentId": instrument_id,
+            "valueUsd": amount,
+            "pending": True,
+        }
+    ]
+    new_state["cashUsd"] = state["cashUsd"] - amount
+    _atomic_write_json(state_dir / POSITIONS_FILE, new_state)
+    return position_id
+
+
+def _safe_register_local_exposure(
+    state_dir: Path, state: dict, symbol: str, instrument_id, amount: float
+) -> None:
+    """Wrapper best-effort de _register_local_exposure: la orden YA fue
+    enviada (exitosa o ambigua) cuando esto se llama, así que un fallo acá
+    (disco lleno, permisos) no debe esconder ese resultado ni cambiar el
+    exit code — solo advertir en stderr de que el próximo snapshot es más
+    urgente que de costumbre, porque el state en disco quedó desactualizado."""
+    try:
+        _register_local_exposure(state_dir, state, symbol, instrument_id, amount)
+    except Exception as exc:
+        print(
+            f"WARN: la orden se envió pero no se pudo registrar la exposición local en "
+            f"{POSITIONS_FILE}: {exc}. Corré snapshot.py cuanto antes.",
+            file=sys.stderr,
+        )
+
+
+def _parse_iso_datetime(raw) -> datetime:
+    """Parsea una fecha ISO 8601 (tolera sufijo 'Z'). Usado tanto para
+    positions.json.updatedAt (regla 10) como para candle.fromDate (regla 9)
+    — misma lógica, un solo lugar. Ausente/no-string/no-parseable -> ValueError."""
+    if not raw or not isinstance(raw, str):
+        raise ValueError(f"fecha ausente o no parseable: {raw!r}")
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"fecha no parseable: {raw!r} ({exc})") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _check_state_freshness(state: dict) -> str:
+    """Regla 10. Devuelve un mensaje de bloqueo si el state está stale (o su
+    updatedAt falta/no parsea), o "" si está fresco."""
+    try:
+        updated_at = _parse_iso_datetime(state.get("updatedAt"))
+    except ValueError as exc:
+        return f"state stale: corré snapshot primero (updatedAt ausente o no parseable: {exc})"
+    age = datetime.now(timezone.utc) - updated_at
+    if age > timedelta(hours=STATE_MAX_AGE_HOURS):
+        return (
+            f"state stale: corré snapshot primero (updatedAt de hace "
+            f"{age.total_seconds() / 3600:.1f}h, máx {STATE_MAX_AGE_HOURS}h)"
+        )
+    return ""
+
+
 def make_client() -> EtoroClient:
     """Factory del cliente HTTP real. Mockeable: main() acepta un make_client
     alternativo (p.ej. lambda: MagicMock()) para tests sin red."""
@@ -127,6 +263,10 @@ def make_client() -> EtoroClient:
 def _is_dry_run() -> bool:
     """Fail-safe: si la env var falta o es != '0', dry-run."""
     return os.environ.get("DRY_RUN") != "0"
+
+
+def _is_finite_positive(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
 
 
 # -- CLI ---------------------------------------------------------------
@@ -153,30 +293,53 @@ def _build_parser() -> argparse.ArgumentParser:
 def _resolve_instrument_id(client, symbol: str):
     """Resuelve symbol -> instrumentId vía search_instrument(). Tolera que la
     respuesta traiga los items bajo 'items' o 'instruments'. Exige match
-    exacto de internalSymbolFull (docs/api-notes.md: nunca hardcodear ids)."""
+    exacto de internalSymbolFull (docs/api-notes.md: nunca hardcodear ids).
+
+    Regla 13: si hay más de un match exacto, no toma el primero
+    silenciosamente — una metadata ambigua no debe resolverse arbitrariamente
+    a "cualquiera de los dos" (mismo criterio que snapshot.py con metadata
+    inconsistente)."""
     resp = client.search_instrument(symbol)
     items = (resp.get("items") if isinstance(resp, dict) else None) or (
         resp.get("instruments") if isinstance(resp, dict) else None
     ) or []
-    match = next(
-        (
-            item
-            for item in items
-            if str(item.get("internalSymbolFull", "")).strip().upper() == symbol
-        ),
-        None,
-    )
-    if match is None:
+    matches = [
+        item
+        for item in items
+        if str(item.get("internalSymbolFull", "")).strip().upper() == symbol
+    ]
+    if not matches:
         raise ValueError(f"símbolo {symbol} no encontrado en search_instrument")
-    return match["instrumentId"]
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} matches exactos para {symbol} en search_instrument "
+            f"(ambiguo, no se toma el primero silenciosamente): {matches}"
+        )
+    return matches[0]["instrumentId"]
 
 
 def _resolve_current_price(client, instrument_id) -> float:
     """Precio de cierre de la última vela diaria, para calcular el
     StopLossRate absoluto (docs/api-notes.md: StopLossRate es un PRECIO, no
-    un %)."""
+    un %). Regla 9: valida que el precio sea finito y > 0, y que la vela no
+    tenga más de CANDLE_MAX_AGE_DAYS de antigüedad según su 'fromDate' — si
+    'fromDate' falta o no parsea, también se rechaza (fail-closed: sin
+    fecha no se puede confirmar frescura)."""
     resp = client.get_candles(instrument_id, direction="desc", interval="OneDay", count=1)
-    price = resp["candles"][0]["candles"][0]["close"]
+    candle = resp["candles"][0]["candles"][0]
+    price = candle.get("close")
+    if not _is_finite_positive(price):
+        raise ValueError(f"precio de la vela inválido (no finito o <= 0): {price!r}")
+
+    from_date_raw = candle.get("fromDate")
+    from_date = _parse_iso_datetime(from_date_raw)  # ValueError si falta/no parsea
+    age = datetime.now(timezone.utc) - from_date
+    if age > timedelta(days=CANDLE_MAX_AGE_DAYS):
+        raise ValueError(
+            f"vela desactualizada: fromDate={from_date_raw!r} (antigüedad "
+            f"{age.total_seconds() / 86400:.1f} días, máx {CANDLE_MAX_AGE_DAYS})"
+        )
+
     return float(price)
 
 
@@ -215,7 +378,16 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         print(f"DRY_RUN: no se ejecuta open {symbol} amount={amount}")
         return 0
 
-    client = client_factory()
+    try:
+        client = client_factory()
+    except Exception as exc:
+        journal(
+            state_dir,
+            f"ERROR | open {symbol} amount={amount} | no se pudo crear el cliente eToro: "
+            f"{exc} | razon={args.reason}",
+        )
+        print(f"ERROR: no se pudo crear el cliente eToro: {exc}", file=sys.stderr)
+        return 1
 
     try:
         instrument_id = _resolve_instrument_id(client, symbol)
@@ -234,7 +406,8 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         journal(
             state_dir,
             f"ERROR | open {symbol} amount={amount} instrument_id={instrument_id} | "
-            f"no se pudo obtener precio para el stop-loss: {exc} | razon={args.reason}",
+            f"no se pudo obtener un precio válido y fresco para el stop-loss: {exc} | "
+            f"razon={args.reason}",
         )
         print(f"ERROR: no se pudo obtener precio para {symbol}: {exc}", file=sys.stderr)
         return 1
@@ -247,12 +420,17 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
             instrument_id=instrument_id, amount_usd=amount, stop_loss_rate=stop_loss_rate
         )
     except Exception as exc:
+        # Regla 8: un error acá NO prueba que la orden no se haya ejecutado
+        # (regla 1) — registramos la exposición igual, fail-closed, para que
+        # órdenes subsiguientes en la misma corrida no ignoren este monto.
+        _safe_register_local_exposure(state_dir, state, symbol, instrument_id, amount)
         journal(
             state_dir,
             f"AMBIGUO | open {symbol} amount={amount} instrument_id={instrument_id} "
             f"stop_loss_rate={stop_loss_rate} | la orden PUDO haberse ejecutado igual "
             f"pese al error: {exc} | VERIFICAR vía get_pnl() (cache 60s) antes de asumir "
-            f"fallo o de reintentar | razon={args.reason}",
+            f"fallo o de reintentar | se registró la exposición localmente (fail-closed) "
+            f"| razon={args.reason}",
         )
         print(
             f"AMBIGUO: error tras enviar la orden de apertura, verificar con get_pnl() "
@@ -261,6 +439,7 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         )
         return 1
 
+    _safe_register_local_exposure(state_dir, state, symbol, instrument_id, amount)
     journal(
         state_dir,
         f"ABIERTA | open {symbol} amount={amount} instrument_id={instrument_id} "
@@ -274,8 +453,11 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
     position_id = args.position_id
     symbol = args.symbol.strip().upper()
 
-    if position_id.startswith("pending-open:"):
-        msg = f"{position_id} es una orden pendiente (apertura sintética), no una posición cerrable"
+    if position_id.startswith(SYNTHETIC_POSITION_PREFIXES):
+        msg = (
+            f"{position_id} es una orden pendiente/exposición registrada localmente, "
+            "no una posición real cerrable"
+        )
         journal(state_dir, f"BLOQUEADA | close {position_id} {symbol} | {msg} | razon={args.reason}")
         print(f"BLOQUEADA: {msg}", file=sys.stderr)
         return 2
@@ -285,6 +467,25 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
     )
     if entry is None:
         msg = f"position-id {position_id} no existe en el state"
+        journal(state_dir, f"BLOQUEADA | close {position_id} {symbol} | {msg} | razon={args.reason}")
+        print(f"BLOQUEADA: {msg}", file=sys.stderr)
+        return 2
+
+    if entry.get("pending") is True:
+        # Defensa en profundidad: cualquier entrada marcada pending (aunque su
+        # positionId no matchee SYNTHETIC_POSITION_PREFIXES por algún motivo)
+        # tampoco es una posición real cerrable.
+        msg = f"{position_id} está marcada como pendiente en el state, no es cerrable"
+        journal(state_dir, f"BLOQUEADA | close {position_id} {symbol} | {msg} | razon={args.reason}")
+        print(f"BLOQUEADA: {msg}", file=sys.stderr)
+        return 2
+
+    entry_symbol = str(entry.get("symbol", "")).strip().upper()
+    if entry_symbol != symbol:
+        msg = (
+            f"--symbol {symbol} no coincide con el symbol real de la posición "
+            f"{position_id} en el state ({entry_symbol!r})"
+        )
         journal(state_dir, f"BLOQUEADA | close {position_id} {symbol} | {msg} | razon={args.reason}")
         print(f"BLOQUEADA: {msg}", file=sys.stderr)
         return 2
@@ -300,7 +501,16 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
         print(f"DRY_RUN: no se ejecuta close {position_id} {symbol}")
         return 0
 
-    client = client_factory()
+    try:
+        client = client_factory()
+    except Exception as exc:
+        journal(
+            state_dir,
+            f"ERROR | close {position_id} {symbol} | no se pudo crear el cliente eToro: "
+            f"{exc} | razon={args.reason}",
+        )
+        print(f"ERROR: no se pudo crear el cliente eToro: {exc}", file=sys.stderr)
+        return 1
 
     try:
         # POST de trading: NUNCA reintentar (ver docstring del módulo, regla 1).
@@ -354,6 +564,15 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
         except OSError as journal_exc:
             print(f"ERROR: no se pudo journalear tampoco: {journal_exc}", file=sys.stderr)
         return 1
+
+    # Regla 10: state stale (o updatedAt ausente/no parseable) bloquea toda
+    # operación, open o close — un state viejo puede estar ocultando
+    # exposición o cash reales.
+    staleness_msg = _check_state_freshness(state)
+    if staleness_msg:
+        journal(state_dir, f"BLOQUEADA | {args.action} | {staleness_msg} | razon={args.reason}")
+        print(f"BLOQUEADA: {staleness_msg}", file=sys.stderr)
+        return 2
 
     if args.action == "open":
         return _handle_open(args, state, equity_rows, state_dir, make_client)

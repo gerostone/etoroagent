@@ -1,5 +1,7 @@
 import json
+import math
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,8 +14,18 @@ from etoro_api import EtoroUnknownOutcomeError
 
 # -- Fixtures -------------------------------------------------------------
 
+
+def _fresh_updated_at():
+    """Timestamp UTC 'ahora', para que el nuevo guard de frescura del state
+    (regla 10 de place_order.py: bloquea si updatedAt tiene >24h) no
+    interfiera con tests que ejercitan otras reglas. Se recalcula en cada
+    llamada — usar esto en vez de una constante hardcodeada evita que la
+    suite se vuelva flaky con el paso del tiempo real."""
+    return datetime.now(timezone.utc).isoformat()
+
+
 STATE_BASIC = {
-    "updatedAt": "2026-08-04T00:00:00+00:00",
+    "updatedAt": _fresh_updated_at(),
     "portfolioId": "pf-1",
     "cashUsd": 1000.0,
     "positions": [
@@ -39,10 +51,15 @@ def write_state(tmp_path, state=None, equity_rows=None):
     return state_dir
 
 
-def candles_resp(close):
+def candles_resp(close, from_date=None):
+    """from_date default: 'ahora' (vela fresca) — así los tests existentes,
+    que no ejercitan la regla de frescura de vela, no se ven afectados por
+    ella. Los tests que sí la ejercitan pasan un from_date explícito."""
+    if from_date is None:
+        from_date = _fresh_updated_at()
     return {
         "candles": [
-            {"candles": [{"close": close}]},
+            {"candles": [{"close": close, "fromDate": from_date}]},
         ]
     }
 
@@ -53,7 +70,7 @@ def candles_resp(close):
 def test_open_excede_max_position_pct_bloquea_sin_llamar_cliente(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     state = {
-        "updatedAt": "x",
+        "updatedAt": _fresh_updated_at(),
         "portfolioId": "pf-1",
         "cashUsd": 80.0,
         "positions": [
@@ -192,7 +209,7 @@ def test_close_real_cierra_posicion(tmp_path, monkeypatch):
 def test_close_posicion_sintetica_bloquea(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     state = {
-        "updatedAt": "x",
+        "updatedAt": _fresh_updated_at(),
         "portfolioId": "pf-1",
         "cashUsd": 100.0,
         "positions": [
@@ -272,7 +289,7 @@ def test_open_amount_mayor_a_cash_bloquea(tmp_path, monkeypatch):
     símbolo de la orden (QQQ, sin posición previa)."""
     monkeypatch.setenv("DRY_RUN", "0")
     state = {
-        "updatedAt": "x",
+        "updatedAt": _fresh_updated_at(),
         "portfolioId": "pf-1",
         "cashUsd": 50.0,
         "positions": [
@@ -337,3 +354,335 @@ def test_state_ausente_devuelve_rc_1(tmp_path, monkeypatch):
     journal = (state_dir / "journal.md").read_text()
     assert "ERROR" in journal
     assert "state" in journal.lower()
+
+
+# -- 11: registro de exposición intra-corrida (fix quality review #1) -------
+
+
+def _mock_client_for(symbol, instrument_id, close=100.0):
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [{"instrumentId": instrument_id, "internalSymbolFull": symbol}]
+    }
+    client.get_candles.return_value = candles_resp(close)
+    client.open_position_by_amount.return_value = {"positionID": instrument_id}
+    return client
+
+
+def test_open_dos_veces_en_la_misma_corrida_excede_25_acumulado(tmp_path, monkeypatch):
+    """Sin el fix, cada invocación de place_order.py relee positions.json
+    desde disco sin ver lo que la corrida anterior (misma sesión del agente,
+    proceso distinto) recién abrió — porque get_pnl() cachea 60s del lado de
+    eToro y un re-snapshot inmediato no alcanza a reflejarlo. Dos aperturas
+    de QQQ por 200 cada una, sobre un portfolio de 1000, deberían acumular
+    40% y la segunda debe bloquearse por el 25%."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+
+    client1 = _mock_client_for("QQQ", 42)
+    rc1 = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client1,
+    )
+    assert rc1 == 0
+
+    on_disk = json.loads((state_dir / "positions.json").read_text())
+    assert on_disk["cashUsd"] == 800.0
+    assert len(on_disk["positions"]) == 1
+    assert on_disk["positions"][0]["symbol"] == "QQQ"
+    assert on_disk["positions"][0]["valueUsd"] == 200.0
+    assert on_disk["positions"][0]["positionId"].startswith("local-open:")
+    assert on_disk["positions"][0]["pending"] is True
+
+    client2 = _mock_client_for("QQQ", 42)
+    rc2 = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client2,
+    )
+    assert rc2 == 2
+    client2.search_instrument.assert_not_called()
+    client2.open_position_by_amount.assert_not_called()
+
+
+def test_open_btc_luego_eth_excede_35_cripto_acumulado(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+
+    client_btc = _mock_client_for("BTC", 1, close=50000.0)
+    rc1 = place_order.main(
+        ["open", "--symbol", "BTC", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client_btc,
+    )
+    assert rc1 == 0
+
+    # BTC 200 (20%, dentro del 25% individual y del 35% cripto) ya registrado
+    # localmente. ETH 200 individualmente también entraría (20%), pero
+    # combinado (200+200)/1000 = 40% > 35% cripto -> debe bloquear.
+    client_eth = _mock_client_for("ETH", 2, close=3000.0)
+    rc2 = place_order.main(
+        ["open", "--symbol", "ETH", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client_eth,
+    )
+    assert rc2 == 2
+    client_eth.open_position_by_amount.assert_not_called()
+
+
+def test_open_ambiguo_registra_exposicion_local(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+    client = _mock_client_for("QQQ", 42)
+    client.open_position_by_amount.side_effect = EtoroUnknownOutcomeError("body raro")
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    on_disk = json.loads((state_dir / "positions.json").read_text())
+    assert on_disk["cashUsd"] == 800.0
+    assert len(on_disk["positions"]) == 1
+    assert on_disk["positions"][0]["symbol"] == "QQQ"
+    assert on_disk["positions"][0]["valueUsd"] == 200.0
+
+
+def test_close_posicion_local_open_bloquea(tmp_path, monkeypatch):
+    """Extensión defensiva del guard de posiciones sintéticas (regla 5):
+    una posición 'local-open:...' registrada por este mismo script tras un
+    open (fix #1) tampoco tiene un positionId real de eToro — cerrarla
+    literalmente mandaría un id inventado a la API."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 800.0,
+        "positions": [
+            {
+                "positionId": "local-open:abc123",
+                "symbol": "QQQ",
+                "instrumentId": 42,
+                "valueUsd": 200.0,
+                "pending": True,
+            }
+        ],
+    }
+    write_state(tmp_path, state, [("2026-08-01", 1000.0)])
+    client = MagicMock()
+    rc = place_order.main(
+        ["close", "--position-id", "local-open:abc123", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.close_position.assert_not_called()
+
+
+# -- 12: precio de vela inválido (fix quality review #2) --------------------
+
+
+@pytest.mark.parametrize("bad_close", [0.0, -50.0, math.inf, math.nan])
+def test_open_precio_de_vela_invalido_bloquea_sin_abrir(tmp_path, monkeypatch, bad_close):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+    }
+    client.get_candles.return_value = candles_resp(bad_close)
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    client.open_position_by_amount.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "ERROR" in journal
+
+
+# -- 13: frescura de la vela (fix quality review #3) -------------------------
+
+
+def test_open_vela_de_10_dias_bloquea_por_desactualizada(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+    }
+    stale_from_date = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    client.get_candles.return_value = candles_resp(100.0, from_date=stale_from_date)
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    client.open_position_by_amount.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "ERROR" in journal
+
+
+def test_open_vela_sin_fromdate_bloquea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+    }
+    client.get_candles.return_value = {"candles": [{"candles": [{"close": 100.0}]}]}
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    client.open_position_by_amount.assert_not_called()
+
+
+# -- 14: close --symbol debe coincidir con el symbol real (fix #4) ----------
+
+
+def test_close_symbol_no_coincide_con_state_bloquea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)  # pos-9 es QQQ
+    client = MagicMock()
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "SPY"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.close_position.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "BLOQUEADA" in journal
+
+
+# -- 15: crash de make_client no debe dar traceback pelado (fix #5) ---------
+
+
+def test_open_make_client_crashea_journalea_error_y_rc1(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+
+    def make_client_que_crashea():
+        raise ValueError("faltan credenciales ETORO_API_KEY/ETORO_USER_KEY")
+
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=make_client_que_crashea,
+    )
+    assert rc == 1
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "ERROR" in journal
+    assert "credenciales" in journal.lower()
+
+
+def test_close_make_client_crashea_journalea_error_y_rc1(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+
+    def make_client_que_crashea():
+        raise ValueError("faltan credenciales")
+
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=make_client_que_crashea,
+    )
+    assert rc == 1
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "ERROR" in journal
+
+
+# -- 16 (minor a): 2+ matches exactos en search -> exit 1, no primer match --
+
+
+def test_open_multiples_matches_exactos_en_search_bloquea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [
+            {"instrumentId": 42, "internalSymbolFull": "QQQ"},
+            {"instrumentId": 99, "internalSymbolFull": "QQQ"},
+        ]
+    }
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    client.get_candles.assert_not_called()
+    client.open_position_by_amount.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "ERROR" in journal
+
+
+# -- 17 (minor b): state con updatedAt > 24h -> exit 2 "state stale" --------
+
+
+def test_state_stale_mas_de_24h_bloquea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    stale_state = dict(STATE_BASIC)
+    stale_state["updatedAt"] = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+    write_state(tmp_path, stale_state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.search_instrument.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "stale" in journal.lower()
+
+
+def test_state_stale_bloquea_tambien_close(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    stale_state = dict(STATE_BASIC)
+    stale_state["updatedAt"] = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
+    write_state(tmp_path, stale_state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.close_position.assert_not_called()
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "stale" in journal.lower()
