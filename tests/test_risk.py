@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -64,3 +65,102 @@ def test_modo_defensivo_bloquea_compras():
 def test_drawdown_pct():
     assert abs(drawdown_pct(EQUITY_DD) - (1 / 3)) < 1e-9
     assert drawdown_pct([]) == 0.0
+
+
+# --- Fixes: fail-closed ante state/equity malformados, NaN y símbolos no normalizados ---
+
+
+def test_symbol_none_en_state_bloquea_open():
+    state = {
+        "cashUsd": 100.0,
+        "positions": [
+            {"symbol": None, "valueUsd": 60.0},
+            {"symbol": "BTC", "valueUsd": 40.0},
+        ],
+    }
+    ok, msg = validate(open_order(), state, EQUITY_OK)
+    assert not ok and "símbolo" in msg.lower()
+
+
+def test_symbol_minuscula_en_state_se_normaliza_y_sigue_bloqueando():
+    state = {
+        "cashUsd": 100.0,
+        "positions": [
+            {"symbol": "spy", "valueUsd": 60.0},
+            {"symbol": "btc", "valueUsd": 40.0},
+        ],
+    }
+    # "spy" en minúscula debe normalizarse a "SPY" y seguir contando como 30% ya invertido
+    ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
+    assert not ok and "25%" in msg
+
+
+def test_state_sin_positions_bloquea_open():
+    state = {"cashUsd": 100.0}
+    ok, msg = validate(open_order(), state, EQUITY_OK)
+    assert not ok and "malformado" in msg.lower()
+
+
+def test_state_sin_cashusd_bloquea_open():
+    state = {"positions": [{"symbol": "SPY", "valueUsd": 60.0}]}
+    ok, msg = validate(open_order(), state, EQUITY_OK)
+    assert not ok and "malformado" in msg.lower()
+
+
+def test_valueusd_no_numerico_bloquea_open():
+    state = {
+        "cashUsd": 100.0,
+        "positions": [{"symbol": "SPY", "valueUsd": "sesenta"}],
+    }
+    ok, msg = validate(open_order(), state, EQUITY_OK)
+    assert not ok and "malformado" in msg.lower()
+
+
+def test_equity_vacio_bloquea_open():
+    ok, msg = validate(open_order(), STATE, [])
+    assert not ok and "equity" in msg.lower()
+
+
+def test_close_permitido_incluso_con_state_y_equity_malformados():
+    ok, _ = validate(OrderRequest("close", "SPY", 60.0, None), {}, [])
+    assert ok
+
+
+def test_bloquea_amount_nan():
+    ok, _ = validate(open_order(amount=float("nan")), STATE, EQUITY_OK)
+    assert not ok
+
+
+def test_bloquea_amount_inf():
+    ok, _ = validate(open_order(amount=float("inf")), STATE, EQUITY_OK)
+    assert not ok
+
+
+def test_bloquea_equity_con_nan_en_ultima_fila_pese_a_drawdown_real_alto():
+    equity = [("2026-08-01", 500.0), ("2026-08-02", 100.0), ("2026-08-03", float("nan"))]
+    ok, _ = validate(open_order(), STATE, equity)
+    assert not ok
+
+
+def test_limite_posicion_exacto_25pct_pasa():
+    ok, msg = validate(open_order(amount=50.0), STATE, EQUITY_OK)  # 50/200 = 25% exacto
+    assert ok, msg
+
+
+def test_drawdown_exacto_25pct_bloquea():
+    equity = [("2026-08-01", 400.0), ("2026-08-02", 300.0)]  # drawdown exacto 25%
+    ok, msg = validate(open_order(), STATE, equity)
+    assert not ok and "defensivo" in msg.lower()
+
+
+def test_bloquea_total_portfolio_cero():
+    state = {"cashUsd": 0.0, "positions": []}
+    ok, msg = validate(open_order(), state, EQUITY_OK)
+    assert not ok and "dimensionar" in msg.lower()
+
+
+def test_bloquea_amount_cero_o_negativo():
+    ok, msg = validate(open_order(amount=0.0), STATE, EQUITY_OK)
+    assert not ok and "monto" in msg.lower()
+    ok2, msg2 = validate(open_order(amount=-5.0), STATE, EQUITY_OK)
+    assert not ok2 and "monto" in msg2.lower()
