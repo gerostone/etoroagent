@@ -2,3 +2,9 @@
 state/
 reports/
 *.lock
+.venv/
+__pycache__/
+*.pyc
+docs/api-notes.md
+.omc/
+.claude/settings.local.json
