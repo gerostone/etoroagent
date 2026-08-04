@@ -8,10 +8,26 @@ riesgo de `scripts/risk.py`). Este hook intercepta cada tool call Bash y
 bloquea cualquier via alternativa: curl/wget/httpie contra los endpoints de
 escritura de la API, o uso inline de `EtoroClient` desde `python -c`/heredoc.
 
-Complementa (no reemplaza) las reglas de PLAYBOOK.md: el agente igual puede
-saltarselo escribiendo un script .py nuevo a disco y ejecutandolo (ver el
-reporte de la tarea para el listado de bypasses conocidos, mitigados por el
-PLAYBOOK y por revision humana del journal).
+Complementa (no reemplaza) las reglas de PLAYBOOK.md. Bypass residual
+aceptado (no cerrado por este hook): escribir un script .py nuevo a disco y
+ejecutarlo. Se mitiga con PLAYBOOK.md (que exige que `scripts/place_order.py`
+sea la unica via de escritura, con su propia validacion interna de riesgo)
+y con revision humana del journal — no hay forma de cerrar ese bypass desde
+un hook que solo inspecciona el texto del comando Bash.
+
+Matching robusto contra ofuscacion de shell: antes de correr los patrones,
+generamos una copia NORMALIZADA del comando (sin comillas simples/dobles ni
+backslashes) porque bash concatena literales quoted adyacentes sin
+separador al sacar las comillas (p.ej. "trad""ing" -> trading). Sin esto,
+alguien podria partir cualquier substring vigilado (dominio, endpoint,
+EtoroClient) en pedazos quoted y evadir el matching por texto plano. Todos
+los patrones corren tanto sobre el comando crudo como sobre el normalizado;
+basta que cualquiera de los dos matchee para bloquear.
+
+Ademas, ante la API de eToro, un metodo HTTP no-literal (variable de shell
+como -X "$METHOD", o cualquier valor que no sea exactamente GET/HEAD)
+se trata como escritura y se bloquea fail-closed: no podemos confirmar que
+sea una lectura segura, asi que asumimos lo peor.
 
 Contrato de hooks de Claude Code: JSON por stdin
 `{"tool_name": "Bash", "tool_input": {"command": "..."}}`.
@@ -36,15 +52,24 @@ MENSAJE = (
 
 API_DOMAIN = "public-api.etoro.com"
 
-# Indicadores de metodo de escritura (curl/wget/httpie u otro cliente HTTP).
-# Cualquiera de estos, combinado con el dominio de la API, implica una
-# escritura (POST/PUT/PATCH/DELETE) por fuera de place_order.py.
-_ESCRITURA_RE = re.compile(
+# Quitamos comillas y backslashes para neutralizar el quote-splitting de
+# bash: "trad""ing" y 'trad''ing' se leen como "trading" una vez que el
+# shell las concatena; si buscaramos el substring solo en el texto crudo,
+# alguien podria partir cualquier patron vigilado en pedazos quoted.
+_QUOTE_CHARS = "'\"\\"
+_NORMALIZAR_TABLE = str.maketrans("", "", _QUOTE_CHARS)
+
+
+def _normalizar(command: str) -> str:
+    return command.translate(_NORMALIZAR_TABLE)
+
+
+# Indicadores de payload de escritura (curl/wget/httpie u otro cliente
+# HTTP). Cualquiera de estos, combinado con el dominio de la API, implica
+# una escritura por fuera de place_order.py — independiente del metodo.
+_DATA_INDICATORS_RE = re.compile(
     r"("
-    r"-X\s*(POST|DELETE|PUT|PATCH)\b"
-    r"|--request[=\s]+(POST|DELETE|PUT|PATCH)\b"
-    r"|--method[=\s]+(POST|DELETE|PUT|PATCH)\b"
-    r"|--data-raw\b"
+    r"--data-raw\b"
     r"|--data-binary\b"
     r"|--data\b"
     r"|-d\s"
@@ -55,6 +80,39 @@ _ESCRITURA_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+# Flags de metodo HTTP: -X, --request, --method. Capturamos el valor tal
+# cual aparece (pegado o separado, con "=" o espacio) para evaluarlo
+# despues: solo GET/HEAD literales se consideran lectura segura.
+_METODO_FLAG_RE = re.compile(
+    r"(?:(?<=\s)|^)-X\s*(\S+)"
+    r"|--request(?:=|\s+)(\S+)"
+    r"|--method(?:=|\s+)(\S+)",
+    re.IGNORECASE,
+)
+_METODOS_SEGUROS = {"GET", "HEAD"}
+_VALOR_STRIP_CHARS = "'\"\\;&|"
+
+
+def _metodo_no_es_lectura_segura(command: str) -> bool:
+    """True si aparece -X/--request/--method con un valor que no sea
+    literalmente GET/HEAD: variables de shell ($METHOD), valores partidos
+    por comillas, o cualquier cosa no reconocible se tratan fail-closed
+    como escritura (no podemos confirmar que sea una lectura segura)."""
+    for match in _METODO_FLAG_RE.finditer(command):
+        valor = next((g for g in match.groups() if g), "").strip(_VALOR_STRIP_CHARS)
+        if valor.upper() not in _METODOS_SEGUROS:
+            return True
+    return False
+
+
+def _es_escritura_directa_a_api(command: str) -> bool:
+    if API_DOMAIN not in command.lower():
+        return False
+    if _DATA_INDICATORS_RE.search(command):
+        return True
+    return _metodo_no_es_lectura_segura(command)
+
 
 # Referencias directas a los endpoints/metodos de trading, sin importar el
 # dominio ni el cliente HTTP usado: si el comando los menciona, se bloquea.
@@ -71,12 +129,6 @@ _ETORO_CLIENT_RE = re.compile(r"EtoroClient\s*\(")
 _PYTHON_INLINE_RE = re.compile(r"python3?\s+(-\w*\s*)*-c\b")
 
 
-def _es_escritura_directa_a_api(command: str) -> bool:
-    if API_DOMAIN not in command.lower():
-        return False
-    return bool(_ESCRITURA_RE.search(command))
-
-
 def _referencia_trading_por_cualquier_via(command: str) -> bool:
     if _ENDPOINT_TRADING_RE.search(command):
         return True
@@ -84,6 +136,14 @@ def _referencia_trading_por_cualquier_via(command: str) -> bool:
         if _PYTHON_INLINE_RE.search(command) or "<<" in command:
             return True
     return False
+
+
+def _bloqueado(command: str) -> bool:
+    """Corre todos los chequeos sobre UNA variante del comando (cruda o
+    normalizada). El llamador decide sobre cuales variantes iterar."""
+    return _es_escritura_directa_a_api(command) or _referencia_trading_por_cualquier_via(
+        command
+    )
 
 
 def main() -> int:
@@ -102,9 +162,10 @@ def main() -> int:
     if not isinstance(command, str):
         return 0
 
-    if _es_escritura_directa_a_api(command) or _referencia_trading_por_cualquier_via(
-        command
-    ):
+    # Corremos todos los patrones sobre el comando crudo Y sobre la version
+    # normalizada (sin comillas/backslashes): alcanza con que cualquiera de
+    # las dos variantes matchee para bloquear (ver docstring del modulo).
+    if _bloqueado(command) or _bloqueado(_normalizar(command)):
         sys.stderr.write(MENSAJE)
         return 2
 

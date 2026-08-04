@@ -159,3 +159,67 @@ def test_missing_tool_input_no_rompe():
         ["python3", str(HOOK)], input=payload, capture_output=True, text=True
     )
     assert r.returncode == 0
+
+
+# --- Fixes del spec review de Task 6: quote-splitting + metodo no explicito ---
+#
+# (a) combina las dos tecnicas del review: el endpoint viene partido por
+#     comillas adyacentes ("trad""ing/exec""ution/market-open""-orders", que
+#     bash concatena a "trading/execution/market-open-orders") Y el metodo
+#     viaja en una variable de shell ($M) en vez de como literal POST. Antes
+#     del fix ninguna de las dos capas (indicador de escritura + patron de
+#     endpoint) lo detectaba.
+def test_bloquea_quote_split_endpoint_mas_metodo_en_variable():
+    r = run_hook(
+        'M=POST; curl -X "$M" '
+        'https://public-api.etoro.com/api/v1/'
+        '"trad""ing/exec""ution/market-open""-orders"/by-amount'
+    )
+    assert r.returncode == 2
+    assert "place_order" in r.stderr
+
+
+# (b) metodo puro en variable de shell, contra un endpoint que NO matchea
+#     ningun patron hardcodeado (agent-portfolios/.../positions no contiene
+#     "market-open-orders" ni "trading/execution"): solo el fail-closed de
+#     "-X con valor no literal GET/HEAD" puede bloquear esto.
+def test_bloquea_metodo_en_variable_de_shell_sin_endpoint_conocido():
+    r = run_hook(
+        'curl -X "$METHOD" https://public-api.etoro.com/api/v1/agent-portfolios/x/positions'
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_dash_x_post_pegado_sin_espacio():
+    r = run_hook(
+        "curl -XPOST https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_request_igual_post_con_signo_igual():
+    r = run_hook(
+        "curl --request=POST https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 2
+
+
+def test_permite_dash_x_get_explicito():
+    r = run_hook(
+        "curl -X GET https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 0
+
+
+def test_permite_request_get_explicito():
+    r = run_hook(
+        "curl --request GET https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 0
+
+
+def test_bloquea_dominio_quote_split_con_data():
+    r = run_hook(
+        "curl --data '{}' https://\"public-api\"\".etoro.com\"/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 2
