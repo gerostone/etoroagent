@@ -8,3 +8,5 @@ __pycache__/
 docs/api-notes.md
 .omc/
 .claude/settings.local.json
+
+.DS_Store
