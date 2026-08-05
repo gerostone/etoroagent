@@ -57,6 +57,11 @@ siempre, sin excepción:
   13. Si search_instrument devuelve más de un match exacto para el mismo
       símbolo, se bloquea (exit 1) en vez de tomar el primero silenciosamente
       — una ambigüedad de instrumentId no se resuelve arbitrariamente.
+  14. Si search_instrument NO devuelve ningún match exacto para el símbolo
+      pedido y ese símbolo es cripto conocido (risk.CRYPTO_SEARCH_VARIANTS),
+      se reintenta con las variantes de formato conocidas (p.ej. BTCUSD para
+      BTC) en orden, usando la primera variante con match exacto y no
+      ambiguo. Se journalea/loguea (stderr) qué variante se usó.
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp UTC y la razón pasada por --reason.
@@ -73,7 +78,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from etoro_api import EtoroClient  # noqa: E402
-from risk import OrderRequest, validate  # noqa: E402
+from risk import CRYPTO_SEARCH_VARIANTS, OrderRequest, validate  # noqa: E402
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 POSITIONS_FILE = "positions.json"
@@ -290,32 +295,62 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _search_exact_matches(client, symbol: str) -> list:
+    """Devuelve los items con match EXACTO de internalSymbolFull para
+    `symbol` (0, 1 o N — el caller decide qué hacer con cada cardinalidad).
+    Tolera que la respuesta traiga los items bajo 'items' o 'instruments'."""
+    resp = client.search_instrument(symbol)
+    items = (resp.get("items") if isinstance(resp, dict) else None) or (
+        resp.get("instruments") if isinstance(resp, dict) else None
+    ) or []
+    return [
+        item
+        for item in items
+        if str(item.get("internalSymbolFull", "")).strip().upper() == symbol
+    ]
+
+
 def _resolve_instrument_id(client, symbol: str):
-    """Resuelve symbol -> instrumentId vía search_instrument(). Tolera que la
-    respuesta traiga los items bajo 'items' o 'instruments'. Exige match
+    """Resuelve symbol -> instrumentId vía search_instrument(). Exige match
     exacto de internalSymbolFull (docs/api-notes.md: nunca hardcodear ids).
 
     Regla 13: si hay más de un match exacto, no toma el primero
     silenciosamente — una metadata ambigua no debe resolverse arbitrariamente
     a "cualquiera de los dos" (mismo criterio que snapshot.py con metadata
-    inconsistente)."""
-    resp = client.search_instrument(symbol)
-    items = (resp.get("items") if isinstance(resp, dict) else None) or (
-        resp.get("instruments") if isinstance(resp, dict) else None
-    ) or []
-    matches = [
-        item
-        for item in items
-        if str(item.get("internalSymbolFull", "")).strip().upper() == symbol
-    ]
-    if not matches:
-        raise ValueError(f"símbolo {symbol} no encontrado en search_instrument")
+    inconsistente).
+
+    Fallback de variantes cripto (Task 10, fix reviewer #4): si la búsqueda
+    exacta del símbolo pedido no da NINGÚN match, y el símbolo es una clave
+    conocida de `risk.CRYPTO_SEARCH_VARIANTS` (eToro puede exponer el
+    instrumento bajo un formato distinto, p.ej. BTCUSD en vez de BTC), se
+    prueban las variantes conocidas EN ORDEN y se usa el primer match
+    EXACTO y NO AMBIGUO — una variante ambigua se descarta (no se adivina)
+    y se sigue probando con la siguiente. Un símbolo ambiguo en la búsqueda
+    ORIGINAL no dispara el fallback: sigue siendo un error inmediato (regla
+    13), igual que antes — la ambigüedad no es un problema de "formato de
+    símbolo distinto", así que no tiene sentido probar variantes para
+    resolverla."""
+    matches = _search_exact_matches(client, symbol)
+    if len(matches) == 1:
+        return matches[0]["instrumentId"]
     if len(matches) > 1:
         raise ValueError(
             f"{len(matches)} matches exactos para {symbol} en search_instrument "
             f"(ambiguo, no se toma el primero silenciosamente): {matches}"
         )
-    return matches[0]["instrumentId"]
+
+    for variant in CRYPTO_SEARCH_VARIANTS.get(symbol, []):
+        if variant == symbol:
+            continue
+        variant_matches = _search_exact_matches(client, variant)
+        if len(variant_matches) == 1:
+            print(
+                f"INFO: {symbol} resuelto via variante de busqueda {variant}",
+                file=sys.stderr,
+            )
+            return variant_matches[0]["instrumentId"]
+
+    raise ValueError(f"símbolo {symbol} no encontrado en search_instrument")
 
 
 def _resolve_current_price(client, instrument_id) -> float:

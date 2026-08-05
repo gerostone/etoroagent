@@ -686,3 +686,82 @@ def test_state_stale_bloquea_tambien_close(tmp_path, monkeypatch):
     client.close_position.assert_not_called()
     journal = (tmp_path / "state" / "journal.md").read_text()
     assert "stale" in journal.lower()
+
+
+# -- 18: fallback de variantes cripto en la resolucion de simbolo (Task 10, fix reviewer #4)
+
+
+def test_open_btc_sin_match_exacto_resuelve_via_variante_btcusd(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+    client = MagicMock()
+    client.search_instrument.side_effect = [
+        {"items": []},  # "BTC" exacto: sin match
+        {"items": [{"instrumentId": 99, "internalSymbolFull": "BTCUSD"}]},  # variante
+    ]
+    client.get_candles.return_value = candles_resp(50000.0)
+    client.open_position_by_amount.return_value = {"positionID": 99}
+    rc = place_order.main(
+        ["open", "--symbol", "BTC", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 0
+    assert client.search_instrument.call_args_list == [
+        (("BTC",), {}),
+        (("BTCUSD",), {}),
+    ]
+    client.open_position_by_amount.assert_called_once_with(
+        instrument_id=99, amount_usd=200.0, stop_loss_rate=45000.0
+    )
+    assert "BTCUSD" in capsys.readouterr().err
+
+
+def test_open_equity_sin_match_no_prueba_variantes_sin_cambios(tmp_path, monkeypatch):
+    # QQQ no tiene entrada en CRYPTO_SEARCH_VARIANTS -> comportamiento
+    # identico al de antes de este fix: una sola llamada, error inmediato.
+    monkeypatch.setenv("DRY_RUN", "0")
+    write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {"items": []}
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    client.search_instrument.assert_called_once_with("QQQ")
+    client.open_position_by_amount.assert_not_called()
+
+
+def test_open_btc_sin_ninguna_variante_con_match_falla_igual(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+    client = MagicMock()
+    client.search_instrument.return_value = {"items": []}  # ninguna variante matchea
+    rc = place_order.main(
+        ["open", "--symbol", "BTC", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 1
+    assert client.search_instrument.call_count == 3  # BTC, BTCUSD, BTC-USD
+    client.open_position_by_amount.assert_not_called()

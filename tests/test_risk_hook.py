@@ -561,6 +561,78 @@ def test_bloquea_install_real_sin_puntuacion_antes_del_destino():
     assert r.returncode == 2
 
 
+# --- Fixes reviewer (post Task 10): _REDIR_RE matcheaba '>' DENTRO de -----
+# --- comillas (no es redireccion real) y "->"/">=" (tampoco son redireccion)
+
+
+def test_permite_reason_con_mayor_que_citado_y_risk_md_sin_puntuacion():
+    # El '>' de "stop-loss > 12%" esta DENTRO del string de --reason: no es
+    # una redireccion real de shell (el shell nunca la interpreta como tal
+    # citada). Sin este fix, region_objetivo despues de ese '>' llegaba
+    # hasta "RISK.md" (sin coma/parentesis en el medio) y bloqueaba una
+    # orden legitima.
+    r = run_hook(
+        '.venv/bin/python scripts/place_order.py open --symbol SPY --amount 100 '
+        '--stop-loss-pct 0.1 --reason "stop-loss > 12% respeta RISK.md"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_reason_con_mayor_que_citado_y_playbook_md():
+    r = run_hook(
+        '.venv/bin/python scripts/place_order.py open --symbol QQQ --amount 50 '
+        '--stop-loss-pct 0.1 --reason "momentum > SMA50 ver PLAYBOOK.md antes de operar"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_reason_con_flecha_citada_seguida_de_risk_md():
+    # "->" (flecha) no es sintaxis de redireccion en bash.
+    r = run_hook(
+        '.venv/bin/python scripts/place_order.py open --symbol SPY --amount 10 '
+        '--stop-loss-pct 0.1 --reason "aplicar regla -> revisar RISK.md antes"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_flecha_fuera_de_comillas_encadenada_con_orden_legitima():
+    r = run_hook(
+        "echo 'motivo -> ver RISK.md sin comillas alrededor de la flecha misma' && "
+        ".venv/bin/python scripts/place_order.py open --symbol SPY --amount 10 "
+        "--stop-loss-pct 0.1"
+    )
+    assert r.returncode == 0
+
+
+def test_permite_mayor_o_igual_no_es_redireccion():
+    r = run_hook("curl --version && echo 'a >= b'")
+    assert r.returncode == 0
+
+
+def test_permite_mencion_y_mayor_que_totalmente_dentro_de_comillas():
+    # Tanto el '>' como la mencion a PLAYBOOK.md estan DENTRO del mismo
+    # string citado -> ni siquiera hay un operador real que evaluar.
+    r = run_hook('echo "PLAYBOOK.md > backup"')
+    assert r.returncode == 0
+
+
+def test_bloquea_tee_playbook_fuera_de_comillas_sigue_bloqueando():
+    # Control positivo (regresion): el fix de comillas/flechas no debe
+    # debilitar la deteccion de una escritura real, sin comillas de por medio.
+    r = run_hook("echo malicioso | tee PLAYBOOK.md")
+    assert r.returncode == 2
+
+
+def test_bloquea_redireccion_sobre_scripts_fuera_de_comillas_sigue_bloqueando():
+    r = run_hook("echo malicioso > scripts/place_order.py")
+    assert r.returncode == 2
+
+
+def test_bloquea_append_fuera_de_comillas_sobre_risk_md_sigue_bloqueando():
+    r = run_hook("echo x >> RISK.md")
+    assert r.returncode == 2
+
+
 # --- N4 (Task 10): bypasses residuales ACEPTADOS a proposito ---------------
 #
 # Estos tests documentan (y verifican, para que una regresion futura no los

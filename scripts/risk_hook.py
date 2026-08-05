@@ -230,6 +230,64 @@ def _split_segments(command: str) -> list:
     return segments
 
 
+def _enmascarar_citas(segmento: str) -> str:
+    """Devuelve una copia de `segmento` con el CONTENIDO (no las comillas en
+    si) de cada span citado ('...'/"...") reemplazado por espacios, y los
+    heredocs (`<<DELIM ... DELIM`) copiados intactos — mismo criterio de
+    quote/heredoc-tracking que `_split_segments`, para que un heredoc con
+    comillas sueltas adentro no le arruine la paridad de comillas al resto
+    del segmento. Preserva longitud y posiciones exactas de todo lo demas,
+    para que los offsets de un `re.finditer` sobre el resultado sigan
+    siendo validos como indices contra el `segmento` original.
+
+    Para que hace falta esto (Task 10, fix reviewer): un caracter '>' que
+    aparece DENTRO de comillas (p.ej. `--reason "precio > SMA50, ver
+    RISK.md"`) NO es una redireccion real — el shell nunca lo interpreta
+    como tal, es un caracter literal de un argumento — pero antes de este
+    fix `_REDIR_RE` no distinguia esto y lo trataba igual que un '>' real,
+    dando falso positivo. `_REDIR_RE` se busca SOLO sobre esta version
+    enmascarada (nunca sobre el texto crudo ni sobre las variantes
+    normalizadas, que BORRAN las comillas en vez de enmascararlas y
+    volverian a confundir un '>' citado con uno real: ver
+    `_escribe_sobre_guardrail`).
+
+    A diferencia de `_REDIR_RE`, los operadores-PALABRA (tee/mv/cp/install/
+    ln/sed/dd/truncate) no necesitan esto: bash ejecuta un comando llamado
+    `"tee"` exactamente igual que uno llamado `tee` (las comillas alrededor
+    de una palabra no le cambian el significado, solo evitan que el shell
+    interprete METACARACTERES adentro) — por eso esos operadores se siguen
+    buscando en el segmento normal (ver `_escribe_sobre_guardrail`)."""
+    resultado = list(segmento)
+    quote = None
+    i = 0
+    n = len(segmento)
+    while i < n:
+        ch = segmento[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                resultado[i] = " "
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if segmento.startswith("<<", i):
+            match = _HEREDOC_START_RE.match(segmento, i)
+            if match:
+                delim = match.group(2)
+                end = match.end()
+                i = end
+                closing_re = re.compile(r"(?m)^[ \t]*" + re.escape(delim) + r"[ \t]*$")
+                closing_match = closing_re.search(segmento, i)
+                i = closing_match.end() if closing_match else n
+                continue
+        i += 1
+    return "".join(resultado)
+
+
 # -- Escritura directa a la API (curl/wget/httpie u otro cliente HTTP) ------
 #
 # Indicadores de payload SIEMPRE-escritura (formas largas, sin ambiguedad de
@@ -396,26 +454,51 @@ def _es_requests_inline_con_etoro(segmento: str) -> bool:
 # `cat PLAYBOOK.md > reports/copy.txt` no bloquea por la lectura de
 # PLAYBOOK.md que aparece del lado izquierdo) y lo cortamos en el primer
 # limite que ya no es parte del destino de ESE operador — heredoc (`<<`),
-# redireccion de entrada (`<`), pipe (`|`) o fin de linea — para que texto
-# de OTRO comando en el mismo segmento (el cuerpo de un heredoc journaleado,
-# o un comando posterior a un pipe) no se confunda con el destino real.
-# Ejemplo concreto que esto evita (FP real de journaling): el agente hace
-# `tee -a state/journal.md <<'EOF' ... - ejecutado via scripts/place_order.py ... EOF`
-# — sin el corte en `<<`, el cuerpo del heredoc (que menciona
-# "scripts/place_order.py" como texto de la entrada del journal, no como
-# destino de escritura) bloquearia una operacion legitima.
+# redireccion de entrada (`<`), pipe (`|`), fin de linea, o puntuacion de
+# prosa (`,;:()`) — para que texto de OTRO comando en el mismo segmento (el
+# cuerpo de un heredoc journaleado, un comando posterior a un pipe, o una
+# frase que menciona la palabra de un operador) no se confunda con el
+# destino real. Ejemplos concretos que esto evita (ambos FP reales,
+# encontrados en revision):
+#   - Journaling legitimo: `tee -a state/journal.md <<'EOF' ... - ejecutado
+#     via scripts/place_order.py ... EOF` — sin el corte en `<<`, el cuerpo
+#     del heredoc (que menciona "scripts/place_order.py" como texto de la
+#     entrada del journal, no como destino de escritura) bloquearia una
+#     operacion legitima.
+#   - Prosa en un commit message: "...install, dd of=, truncate, ln) cuyo
+#     destino cae en scripts/x.py..." — sin el corte en `,`/`:`/`(`/`)`, la
+#     palabra "install" usada en prosa (no como comando) mas la mencion de
+#     una ruta guardrail mas adelante en la misma linea bloqueaba el commit
+#     que describe esta misma regla.
 #
-# Esto es una aproximacion por texto, no un parser de shell: para `mv`,
-# `cp`, `install`, `ln`, `sed -i`, `dd of=` y `truncate` no distinguimos con
-# precision el argumento ORIGEN del argumento DESTINO (ambos quedan del
-# lado derecho del operador) — fail-closed deliberado: es preferible
-# bloquear de mas un `mv`/`cp` infrecuente que mencione un guardrail como
-# origen, a dejar pasar una escritura real sobre el destino. `tee` y
-# `>`/`>>` (los operadores que el agente realmente usa para journalear) SI
-# excluyen correctamente el texto anterior al operador.
+# Los operadores-PALABRA (tee/sed -i/mv/cp/install/dd of=/truncate/ln) se
+# buscan en las 3 variantes de texto del segmento (cruda/normalizada/sin
+# concat), igual que el resto del hook: bash los ejecuta igual esten o no
+# citados, asi que las variantes normalizadas siguen sirviendo contra
+# quote-splitting del propio operador (p.ej. "te""e" -> tee).
+#
+# `_REDIR_RE` (`>`/`>>`) es distinto: un '>' SI cambia de significado segun
+# este citado o no (citado = caracter literal, no citado = redireccion real
+# de shell) — por eso se busca SOLO sobre el segmento crudo con las
+# comillas enmascaradas (`_enmascarar_citas`), nunca sobre las variantes
+# normalizadas (que borran las comillas y reintroducirian la ambiguedad).
+# Ademas, `_REDIR_RE` excluye "->" (flecha, comun en texto de --reason) y
+# ">=" (comparacion) — ninguno de los dos es sintaxis de redireccion real
+# en bash, y ambos daban falso positivo en --reason con prosa tipo
+# "regla -> ver PLAYBOOK.md" o "stop-loss > 12%, ver RISK.md" (dentro o
+# fuera de comillas).
+#
+# Fail-closed deliberado para `mv`/`cp`/`install`/`ln`/`sed -i`/`dd of=`/
+# `truncate`: no distinguimos con precision el argumento ORIGEN del
+# argumento DESTINO (ambos quedan del lado derecho del operador) — es
+# preferible bloquear de mas un uso infrecuente que mencione un guardrail
+# como origen, a dejar pasar una escritura real sobre el destino.
 
 _TEE_RE = re.compile(r"\btee\b")
-_REDIR_RE = re.compile(r">{1,2}")
+# (?<!-) excluye "->" (flecha): una '>' precedida por '-' no es redireccion.
+# (?!=) excluye ">=" (comparacion): una '>' seguida de '=' no es redireccion.
+# Ninguna de las dos es sintaxis de redireccion real de bash.
+_REDIR_RE = re.compile(r"(?<!-)>{1,2}(?!=)")
 _SED_I_RE = re.compile(r"\bsed\b[\s\S]{0,60}?-i(?:\.[\w-]+)?\b")
 _MV_RE = re.compile(r"\bmv\b")
 _CP_RE = re.compile(r"\bcp\b")
@@ -424,8 +507,10 @@ _DD_OF_RE = re.compile(r"\bdd\b[\s\S]{0,60}?\bof=")
 _TRUNCATE_RE = re.compile(r"\btruncate\b")
 _LN_RE = re.compile(r"\bln\b")
 
+# Operadores-palabra: buscados en el segmento tal cual (y sus variantes
+# normalizadas, ver _escribe_sobre_guardrail). _REDIR_RE NO va aca: tiene su
+# propio tratamiento (enmascarado de comillas) mas abajo.
 _OPERADORES_ESCRITURA_ARCHIVO = (
-    _REDIR_RE,
     _TEE_RE,
     _SED_I_RE,
     _MV_RE,
@@ -436,16 +521,6 @@ _OPERADORES_ESCRITURA_ARCHIVO = (
     _LN_RE,
 )
 
-# Ademas de heredoc/pipe/newline, cortamos en puntuacion de prosa (coma,
-# parentesis, dos puntos, punto y coma) que practicamente nunca aparece
-# pegada a un argumento de archivo real en estos operadores, pero SI aparece
-# constantemente en texto natural (p.ej. un commit message o una entrada de
-# journal que describe la regla: "...ln) cuyo destino cae en scripts/x.py").
-# Sin este corte, prosa que menciona la palabra de un operador (p.ej.
-# "install") seguida en la misma linea de una ruta guardrail (mencionada
-# como texto, no como destino real) da falso positivo — bug real detectado
-# al commitear este mismo cambio (el propio mensaje de commit describia la
-# regla y quedo bloqueado por su propio patron).
 _LIMITE_OBJETIVO_RE = re.compile(r"<<|<|\||\n|[,;:()]")
 
 # Rutas guardrail: scripts/*.py y scripts/*.sh (no cualquier archivo bajo
@@ -468,11 +543,36 @@ def _region_objetivo(segmento: str, desde: int) -> str:
     return resto[: limite.start()] if limite else resto
 
 
+def _region_apunta_a_guardrail(segmento: str, desde: int) -> bool:
+    region = _region_objetivo(segmento, desde)
+    return bool(
+        _PROTEGIDO_RE.search(region)
+        or _PROTEGIDO_RE.search(_normalizar(region))
+        or _PROTEGIDO_RE.search(_normalizar_sin_concat(region))
+    )
+
+
 def _escribe_sobre_guardrail(segmento: str) -> bool:
-    for operador_re in _OPERADORES_ESCRITURA_ARCHIVO:
-        for m in operador_re.finditer(segmento):
-            if _PROTEGIDO_RE.search(_region_objetivo(segmento, m.end())):
-                return True
+    # Operadores-palabra: sobre las 3 variantes del segmento (indices
+    # consistentes: el match y la region objetivo salen de la MISMA
+    # variante de texto).
+    for variante in (
+        segmento,
+        _normalizar(segmento),
+        _normalizar_sin_concat(segmento),
+    ):
+        for operador_re in _OPERADORES_ESCRITURA_ARCHIVO:
+            for m in operador_re.finditer(variante):
+                if _region_apunta_a_guardrail(variante, m.end()):
+                    return True
+
+    # Redireccion >/>>: solo sobre el segmento crudo con comillas
+    # enmascaradas (ver _enmascarar_citas y el comentario de arriba).
+    enmascarado = _enmascarar_citas(segmento)
+    for m in _REDIR_RE.finditer(enmascarado):
+        if _region_apunta_a_guardrail(segmento, m.end()):
+            return True
+
     return False
 
 
@@ -501,13 +601,8 @@ def _bloqueado(command: str) -> bool:
 
 def _bloqueado_guardrail(command: str) -> bool:
     for segmento in _split_segments(command):
-        for variante in (
-            segmento,
-            _normalizar(segmento),
-            _normalizar_sin_concat(segmento),
-        ):
-            if _escribe_sobre_guardrail(variante):
-                return True
+        if _escribe_sobre_guardrail(segmento):
+            return True
     return False
 
 

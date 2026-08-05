@@ -5,7 +5,35 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from risk import OrderRequest, validate, drawdown_pct, portfolio_value
+from risk import (
+    CRYPTO_SEARCH_VARIANTS,
+    OrderRequest,
+    validate,
+    drawdown_pct,
+    portfolio_value,
+)
+
+
+# --- CRYPTO_SEARCH_VARIANTS (Task 10, fix reviewer #4) ---------------------
+#
+# eToro puede exponer un instrumento cripto bajo un formato de símbolo
+# distinto al que usa el universo/PLAYBOOK (BTCUSD en vez de BTC, etc).
+# candles.py y place_order.py usan este mapeo para reintentar la búsqueda
+# de instrumentId con variantes conocidas cuando la búsqueda exacta del
+# símbolo pedido no da match — ver sus `_resolve_instrument_id`.
+
+
+def test_crypto_search_variants_btc():
+    assert CRYPTO_SEARCH_VARIANTS["BTC"] == ["BTC", "BTCUSD", "BTC-USD"]
+
+
+def test_crypto_search_variants_eth():
+    assert CRYPTO_SEARCH_VARIANTS["ETH"] == ["ETH", "ETHUSD", "ETH-USD"]
+
+
+def test_crypto_search_variants_no_incluye_equities():
+    assert "SPY" not in CRYPTO_SEARCH_VARIANTS
+    assert "QQQ" not in CRYPTO_SEARCH_VARIANTS
 
 STATE = {
     "cashUsd": 100.0,

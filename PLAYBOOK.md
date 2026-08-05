@@ -21,9 +21,11 @@ persistido en `state/` al inicio de cada sesión.
 
 - Velas y precios se consultan exclusivamente con
   `.venv/bin/python scripts/candles.py --symbol <SYMBOL> --count <N> [--interval OneDay]`
-  (imprime un JSON con `symbol`, `instrumentId` y `candles`). No usar el
-  cliente Python inline (bloqueado explícitamente por el hook de riesgo).
-  Para cualquier otro dato de mercado de solo lectura no cubierto por
+  (por default imprime closes en CSV compacto y orden ascendente — ver
+  §Señales para el formato exacto y cómo calcular momentum/SMA con él;
+  `--full` da el JSON crudo si hace falta otro campo). No usar el cliente
+  Python inline (bloqueado explícitamente por el hook de riesgo). Para
+  cualquier otro dato de mercado de solo lectura no cubierto por
   `candles.py`, usar un `curl GET` puntual (nunca POST/PUT/PATCH/DELETE).
 
 - Interpretar los exit codes de `place_order.py`:
@@ -84,17 +86,34 @@ en eso.
 
 ## Señales
 
-El agente calcula estas señales cada corrida a partir de las velas diarias
-devueltas por `scripts/candles.py` (usa el `close` de cada vela;
-`--count N` trae N velas — pedir suficientes para cubrir la ventana de cada
-señal, p.ej. `--count 210` para cubrir 200 días más margen).
+El agente calcula estas señales cada corrida a partir de los cierres
+diarios que entrega `scripts/candles.py`. Por DEFAULT (sin `--full`),
+`candles.py` imprime un formato CSV compacto en orden **ASCENDENTE**
+(viejo→nuevo): una línea de comentario con metadata
+(`# symbol=<SYM> interval=<INTERVAL> count=<N> order=asc`) seguida de una
+línea `<fecha>,<close>` por vela, de la más vieja a la más reciente.
 
-- **Momentum absoluto (63 / 126 días hábiles ≈ 3 / 6 meses):** retorno =
-  (close de hoy / close de hace 63 o 126 velas) − 1, sobre la serie de
-  cierres diarios del símbolo. Positivo = momentum a favor.
-- **Tendencia (SMA50 / SMA200):** promedio simple de los últimos 50 y 200
-  cierres diarios. Comparar el precio actual contra cada media: por encima
-  de la SMA50 = tendencia de corto plazo intacta; por encima de la SMA200 =
+**Verificá el header `order=asc` antes de calcular cualquier señal** — es
+la garantía de que, sobre la lista de closes que arma a partir de esas
+líneas, el índice `-1` es la vela más reciente ("hoy") y el índice
+`-(N+1)` es la de hace N velas. (`--full` devuelve el JSON crudo de la API
+sin reordenar — no es el modo por default y no hace falta para calcular
+señales; usarlo solo si hace falta un campo que el CSV no trae, p.ej.
+volumen.)
+
+`--count N` trae N velas — pedir suficientes para cubrir la ventana de cada
+señal, p.ej. `--count 210` para cubrir 200 días más margen.
+
+- **Momentum absoluto (63 / 126 días hábiles ≈ 3 / 6 meses):** con la lista
+  de closes en orden ascendente, retorno = `close[-1] / close[-64] - 1`
+  (momentum de 63 velas) o `close[-1] / close[-127] - 1` (momentum de 126
+  velas) — el índice es `-(N+1)` porque `close[-1]` ya es "hoy" (0 velas
+  atrás), así que "hace 63 velas" es el índice `-64`. Positivo = momentum a
+  favor.
+- **Tendencia (SMA50 / SMA200):** `SMA50 = promedio(close[-50:])`,
+  `SMA200 = promedio(close[-200:])`, sobre la misma lista ascendente.
+  Comparar el precio actual (`close[-1]`) contra cada media: por encima de
+  la SMA50 = tendencia de corto plazo intacta; por encima de la SMA200 =
   tendencia de largo plazo intacta; cruce por debajo de la SMA200 es señal
   de salida.
 - **Régimen de volatilidad (VIX):** intentar obtener velas de VIX con
@@ -122,9 +141,11 @@ señal, p.ej. `--count 210` para cubrir 200 días más margen).
   sector − retorno SPY). Ordenar de mayor a menor: los de arriba son los
   "líderes" del ranking sectorial.
 - **Cripto (momentum 30 / 90 días + SMA50):** mismo cálculo de retorno que
-  el momentum absoluto pero sobre ventanas de 30 y 90 velas diarias, más la
-  SMA50 de cada símbolo cripto (BTC, ETH), independiente del régimen de
-  acciones — cripto tiene su propio ciclo.
+  el momentum absoluto (misma convención de índices sobre la lista
+  ascendente: `close[-1] / close[-31] - 1` y `close[-1] / close[-91] - 1`)
+  pero sobre ventanas de 30 y 90 velas diarias, más la SMA50 de cada
+  símbolo cripto (BTC, ETH), independiente del régimen de acciones —
+  cripto tiene su propio ciclo.
 
 ## Reglas de decisión
 

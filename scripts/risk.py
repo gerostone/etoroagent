@@ -39,6 +39,19 @@ CRYPTO_SYMBOLS = {
     "BTCEUR", "ETHEUR",
 }
 
+# Variantes de símbolo conocidas para la BÚSQUEDA de instrumento (Task 10,
+# fix reviewer #4) — distinto de CRYPTO_SYMBOLS de arriba (que clasifica
+# posiciones YA resueltas para los topes de riesgo). eToro puede exponer el
+# instrumento cripto bajo un formato de símbolo distinto al que pide el
+# agente (p.ej. BTCUSD en vez de BTC) en `search_instrument`. candles.py y
+# place_order.py usan este mapeo para reintentar la resolución de
+# instrumentId con estas variantes, EN ORDEN, cuando la búsqueda exacta del
+# símbolo pedido no da ningún match — ver sus `_resolve_instrument_id`.
+CRYPTO_SEARCH_VARIANTS = {
+    "BTC": ["BTC", "BTCUSD", "BTC-USD"],
+    "ETH": ["ETH", "ETHUSD", "ETH-USD"],
+}
+
 # Universo cerrado de símbolos operables. Clasificar cripto por igualdad
 # exacta contra CRYPTO_SYMBOLS (o cualquier otra pertenencia a un set fijo)
 # falla ABIERTO ante un formato no listado: un símbolo desconocido no entra
