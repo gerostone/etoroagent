@@ -223,3 +223,139 @@ def test_bloquea_dominio_quote_split_con_data():
         "curl --data '{}' https://\"public-api\"\".etoro.com\"/api/v1/agent-portfolios/x/positions"
     )
     assert r.returncode == 2
+
+
+# --- Quality review round 2: falsos positivos (C1), requests inline (I2), ---
+# --- candles.py (I3), FPs de dev (M8) --------------------------------------
+
+
+# C1: -f (fail silently) NO es -F (form). Antes matcheaba case-insensitive.
+def test_permite_curl_dash_f_minuscula_no_es_form():
+    r = run_hook(
+        "curl -f -sS https://public-api.etoro.com/api/v1/market-data/instruments?symbol=SPY"
+    )
+    assert r.returncode == 0
+
+
+# C1: -D (dump headers) NO es -d (data). Antes matcheaba case-insensitive.
+def test_permite_curl_dash_d_mayuscula_no_es_data():
+    r = run_hook(
+        "curl -D headers.txt https://public-api.etoro.com/api/v1/market-data/instruments?symbol=SPY"
+    )
+    assert r.returncode == 0
+
+
+# C1: -x (proxy) NO es -X (method). Antes matcheaba case-insensitive y
+# tomaba "proxy.local:8080" como un metodo no-GET/HEAD.
+def test_permite_curl_dash_x_minuscula_es_proxy_no_metodo():
+    r = run_hook(
+        "curl -x proxy.local:8080 "
+        "https://public-api.etoro.com/api/v1/market-data/instruments?symbol=SPY"
+    )
+    assert r.returncode == 0
+
+
+# C1: un comando previo inocuo encadenado con && no debe contaminar la
+# lectura GET del segundo segmento (segmentacion + fix de mayus/minusculas).
+def test_permite_comando_previo_encadenado_con_curl_get_de_solo_lectura():
+    r = run_hook(
+        "mkdir -p reports && curl -f -sS "
+        "https://public-api.etoro.com/api/v1/market-data/instruments?symbol=SPY"
+    )
+    assert r.returncode == 0
+
+
+# C1: -G convierte -d en query string (GET), no es una escritura.
+def test_permite_curl_dash_g_con_dash_d_es_get_con_query():
+    r = run_hook(
+        "curl -G -d 'internalSymbolFull=SPY' "
+        "https://public-api.etoro.com/api/v1/market-data/search"
+    )
+    assert r.returncode == 0
+
+
+# C1/M6: -sX POST (flags cortos curl combinados) debe detectarse igual que -X POST.
+def test_bloquea_combo_dash_sx_post():
+    r = run_hook(
+        "curl -sX POST https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 2
+
+
+# M6: -d@archivo (payload leido de archivo, pegado) debe bloquear igual que
+# -d 'json'. URL sin ningun patron de endpoint hardcodeado (agent-portfolios,
+# no market-open-orders) para aislar especificamente el indicador -d@ del
+# chequeo de referencia a endpoint.
+def test_bloquea_dash_d_arroba_pegado():
+    r = run_hook(
+        "curl -d@payload.json "
+        "https://public-api.etoro.com/api/v1/agent-portfolios/x/positions"
+    )
+    assert r.returncode == 2
+
+
+# I2: requests.post inline con la URL completamente partida por comillas Y
+# por el operador de concatenacion "+" (ni el dominio ni el endpoint quedan
+# contiguos en el texto crudo ni en la version solo-sin-comillas).
+def test_bloquea_requests_post_inline_con_concatenacion_partida():
+    r = run_hook(
+        "python3 -c \"import requests; requests.post('https://public-api' + "
+        "'.etoro.com/api/v1/trad' + 'ing/execution/market-open' + "
+        "'-orders/by-amount', json={'InstrumentID': 1})\""
+    )
+    assert r.returncode == 2
+    assert "place_order" in r.stderr
+
+
+# I2 negativo (M8): mencionar "requests.post(" en un grep no es ejecucion
+# inline (no hay python -c / heredoc) -> no debe bloquear.
+def test_permite_grep_de_requests_post_sin_contexto_python_inline():
+    r = run_hook('grep -rn "requests.post(" .')
+    assert r.returncode == 0
+
+
+# I3: candles.py es la tercera via de lectura autorizada.
+def test_permite_candles_script():
+    r = run_hook(
+        ".venv/bin/python scripts/candles.py --symbol SPY --count 210"
+    )
+    assert r.returncode == 0
+
+
+def test_permite_candles_script_con_interval():
+    r = run_hook(
+        ".venv/bin/python scripts/candles.py --symbol SPY --count 210 --interval OneDay"
+    )
+    assert r.returncode == 0
+
+
+# M8: grep/git no son "vehiculos de ejecucion" — mencionar un endpoint de
+# trading en texto (busqueda, mensaje de commit, filtro de log) no debe
+# bloquear la corrida del agente.
+def test_permite_grep_de_endpoint_sin_vehiculo_de_ejecucion():
+    r = run_hook('grep -rn "market-open-orders" .')
+    assert r.returncode == 0
+
+
+def test_permite_git_commit_con_endpoint_en_el_mensaje():
+    r = run_hook(
+        'git commit -m "fix: retry bug en market-open-orders"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_git_log_grep_con_endpoint():
+    r = run_hook("git log --grep=market-close-orders")
+    assert r.returncode == 0
+
+
+# M8 control positivo: la referencia al endpoint SIGUE bloqueando cuando
+# aparece junto a un vehiculo de ejecucion real (ya cubierto por tests mas
+# arriba con curl/wget/python3 -c, repetido aca para dejar el contraste
+# explicito con los negativos de arriba).
+def test_bloquea_endpoint_con_vehiculo_xargs():
+    r = run_hook(
+        "echo https://public-api.etoro.com/api/v1/trading/execution/"
+        "market-open-orders/by-amount | xargs -I{} curl -X POST {}"
+    )
+    assert r.returncode == 2

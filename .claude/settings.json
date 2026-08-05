@@ -6,10 +6,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/risk_hook.py\""
+            "command": "/usr/bin/python3 \"$CLAUDE_PROJECT_DIR/scripts/risk_hook.py\""
           }
         ]
       }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Write(.claude/**)",
+      "Edit(.claude/**)",
+      "Write(scripts/**)",
+      "Edit(scripts/**)",
+      "Write(PLAYBOOK.md)",
+      "Edit(PLAYBOOK.md)",
+      "Write(RISK.md)",
+      "Edit(RISK.md)"
     ]
   }
 }
