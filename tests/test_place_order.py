@@ -808,3 +808,116 @@ def test_open_fuzzy_search_btca_primero_resuelve_btc_100000(tmp_path, monkeypatc
     client.open_position_by_amount.assert_called_once_with(
         instrument_id=100000, amount_usd=200.0, stop_loss_rate=45000.0
     )
+
+
+# -- 18: positionId con tipo distinto entre state y CLI (bug critico) -------
+
+
+def test_close_positionid_entero_en_state_matchea_con_cli_string(tmp_path, monkeypatch):
+    """Bug critico hallado en la primera corrida dry-run real: snapshot.py
+    persiste positionId tal cual lo devuelve la API (puede ser un ENTERO,
+    p.ej. 3533695059), pero argparse siempre entrega --position-id como
+    STRING. Sin normalizar la comparacion, int(3533695059) == str("3533695059")
+    es SIEMPRE False -> ninguna posicion real era cerrable (ninguna salida
+    por regla, SMA200 o ranking, podia ejecutarse). El id que se manda a la
+    API debe ser el ORIGINAL del state (el entero), no el string casteado
+    del CLI -- preservando el tipo que la API espera."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [
+            {"positionId": 3533695059, "symbol": "QQQ", "instrumentId": 7, "valueUsd": 50.0},
+        ],
+    }
+    write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+    rc = place_order.main(
+        ["close", "--position-id", "3533695059", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 0
+    # El id pasado a la API debe ser el ORIGINAL del state (int), no el
+    # string "3533695059" que llego por argparse.
+    client.close_position.assert_called_once_with(position_id=3533695059, instrument_id=7)
+    journal = (tmp_path / "state" / "journal.md").read_text()
+    assert "CERRADA" in journal
+
+
+def test_close_positionid_string_en_state_sigue_matcheando_regresion(tmp_path, monkeypatch):
+    """Regresion: positionId ya guardado como string en el state (caso
+    preexistente) debe seguir matcheando tras el fix de normalizacion."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [
+            {"positionId": "pos-string-9", "symbol": "QQQ", "instrumentId": 7, "valueUsd": 50.0},
+        ],
+    }
+    write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+    rc = place_order.main(
+        ["close", "--position-id", "pos-string-9", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 0
+    client.close_position.assert_called_once_with(position_id="pos-string-9", instrument_id=7)
+
+
+def test_close_positionid_sintetico_sigue_bloqueado_tras_el_fix(tmp_path, monkeypatch):
+    """El fix de normalizacion de tipo no debe relajar el guard de
+    posiciones sinteticas: 'pending-open:x' sigue exit 2 sin llamar API."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [
+            {
+                "positionId": "pending-open:x",
+                "symbol": "QQQ",
+                "instrumentId": 7,
+                "valueUsd": 50.0,
+                "pending": True,
+            },
+        ],
+    }
+    write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    rc = place_order.main(
+        ["close", "--position-id", "pending-open:x", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.close_position.assert_not_called()
+
+
+def test_close_positionid_realmente_inexistente_sigue_exit_2_tras_el_fix(tmp_path, monkeypatch):
+    """El fix de normalizacion de tipo no debe volver todo matcheable: un id
+    que de verdad no existe (ni como int ni como string) sigue bloqueado."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [
+            {"positionId": 3533695059, "symbol": "QQQ", "instrumentId": 7, "valueUsd": 50.0},
+        ],
+    }
+    write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    rc = place_order.main(
+        ["close", "--position-id", "999999999", "--symbol", "QQQ"],
+        state_dir=tmp_path / "state",
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.close_position.assert_not_called()

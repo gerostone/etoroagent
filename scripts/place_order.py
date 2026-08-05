@@ -472,7 +472,16 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
 
 
 def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
-    position_id = args.position_id
+    # BUG CRÍTICO (hallado en la primera corrida dry-run real): snapshot.py
+    # persiste positionId tal cual lo devuelve la API — que puede ser un
+    # ENTERO (p.ej. 3533695059) — mientras que argparse siempre entrega
+    # --position-id como STRING. Comparar sin normalizar (int == str) da
+    # SIEMPRE False, así que ninguna posición real era cerrable: toda salida
+    # por regla (SMA200, ranking) quedaba inoperante. Normalizamos ambos
+    # lados a str().strip() para la búsqueda/comparación, pero el valor que
+    # se manda a la API (más abajo, `real_position_id`) es el ORIGINAL del
+    # state, sin castear — para preservar el tipo que la API espera.
+    position_id = str(args.position_id).strip()
     symbol = args.symbol.strip().upper()
 
     if position_id.startswith(SYNTHETIC_POSITION_PREFIXES):
@@ -485,7 +494,12 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
         return 2
 
     entry = next(
-        (p for p in state.get("positions", []) if p.get("positionId") == position_id), None
+        (
+            p
+            for p in state.get("positions", [])
+            if str(p.get("positionId")).strip() == position_id
+        ),
+        None,
     )
     if entry is None:
         msg = f"position-id {position_id} no existe en el state"
@@ -512,6 +526,10 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
         print(f"BLOQUEADA: {msg}", file=sys.stderr)
         return 2
 
+    # El valor real que se manda a la API es el ORIGINAL del state (puede
+    # ser int, p.ej. 3533695059), NUNCA el string normalizado de arriba —
+    # ver el comentario del bug critico al inicio de esta funcion.
+    real_position_id = entry["positionId"]
     instrument_id = entry["instrumentId"]
 
     if _is_dry_run():
@@ -536,7 +554,7 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
 
     try:
         # POST de trading: NUNCA reintentar (ver docstring del módulo, regla 1).
-        result = client.close_position(position_id=position_id, instrument_id=instrument_id)
+        result = client.close_position(position_id=real_position_id, instrument_id=instrument_id)
     except Exception as exc:
         journal(
             state_dir,
