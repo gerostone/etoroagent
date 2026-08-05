@@ -65,6 +65,15 @@ if [ "$MODE" = "equities" ]; then
   esac
 fi
 
+# Sanitizar entorno anidado: lanzado desde adentro de una sesion de Claude Code,
+# las variables ANTHROPIC_*/CLAUDE_* heredadas rompen la auth del CLI anidado (401).
+# Bajo launchd (entorno limpio) esto es un no-op. Se preserva CLAUDE_BIN si vino seteada.
+_CLAUDE_BIN_OVERRIDE="${CLAUDE_BIN:-}"
+while IFS='=' read -r _v _; do
+  case "$_v" in ANTHROPIC*|CLAUDE*) unset "$_v" 2>/dev/null || true ;; esac
+done < <(env)
+CLAUDE_BIN="$_CLAUDE_BIN_OVERRIDE"
+
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
 if [ -z "$CLAUDE_BIN" ]; then
   # PATH de launchd es mínimo; probar ubicaciones típicas
