@@ -152,7 +152,13 @@ cada propuesta con criterio antes de convertirla en una llamada a
   señales sectoriales?).
 - Eventos conocidos relevantes (earnings, reuniones de la Fed, halvings de
   cripto, feriados de mercado) que puedan invalidar la señal en el corto
-  plazo.
+  plazo. Evaluá estos eventos SOLO con tu conocimiento general y lo que
+  muestren los propios datos de precio/volatilidad (gaps, volumen, VIX). El
+  runner NO concede herramientas web (decisión deliberada: reduce la
+  superficie de prompt-injection en un agente que mueve dinero) — NO tenés
+  acceso web y NO debés intentar conseguirlo. Si la incertidumbre por un
+  evento que recordás es alta, la respuesta es reducir o no operar (regla de
+  oro).
 - Tamaño relativo de la propuesta dentro del portfolio y frente a las
   demás propuestas de la corrida.
 
