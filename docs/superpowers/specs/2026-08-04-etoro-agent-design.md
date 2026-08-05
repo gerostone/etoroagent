@@ -102,7 +102,7 @@ El hook devuelve exit code de bloqueo con mensaje explicativo, para que el agent
 3. **Market data**: precios/históricos del universo (≤ 60 req/min, con `x-request-id` UUID nuevo por request).
 4. **Señales → propuestas** (§5).
 5. **Validación**: cada orden pasa por el hook de riesgo.
-6. **Ejecución**: órdenes aprobadas contra la API; 1 reintento por fallo transitorio.
+6. **Ejecución**: órdenes aprobadas contra la API. Los POSTs de trading NUNCA se reintentan. Un fallo tras el envío se trata como resultado ambiguo: journalear AMBIGUO, esperar >=60s (cache del endpoint de posiciones), correr snapshot y verificar el estado real antes de cualquier decisión.
 7. **Registro**: journal (decisiones + razonamiento), reporte de corrida, estado actualizado.
 
 ## 8. Manejo de errores
@@ -110,7 +110,7 @@ El hook devuelve exit code de bloqueo con mensaje explicativo, para que el agent
 - Regla de oro: **ante la duda, no operar**. Análisis incompleto o datos faltantes → terminar sin operar y registrar.
 - `401` → abortar, marcar alerta en el reporte (key inválida/expirada — los tokens tienen `expiresAt`).
 - `429` → backoff respetando `RateLimit-Reset`.
-- Orden fallida → 1 reintento; si falla, log y continuar con el resto.
+- Los POSTs de trading NUNCA se reintentan. Un fallo tras el envío se trata como resultado ambiguo: journalear AMBIGUO, esperar >=60s (cache del endpoint de posiciones), correr snapshot y verificar el estado real antes de cualquier decisión.
 - Corrida colgada → lockfile con timeout; launchd no solapa corridas.
 
 ## 9. Seguridad

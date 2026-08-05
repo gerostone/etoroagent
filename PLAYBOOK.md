@@ -30,14 +30,16 @@ persistido en `state/` al inicio de cada sesión.
   - `0`: la orden se ejecutó (o, en modo `DRY_RUN`, se habría ejecutado) —
     journalear normalmente.
   - `2`: **bloqueada** por el motor de riesgo o por validación (tamaño,
-    stop-loss, universo, drawdown, state stale, símbolo/posición inválidos).
-    Leer el motivo impreso en stderr, journalearlo tal cual, y **acatarlo**.
-    No reformular la orden para eludir el límite (por ejemplo, no dividir
-    una posición en varias órdenes chicas para esquivar el tope del 25%).
-    Solo tiene sentido reintentar con un monto reducido si el motivo del
-    bloqueo es específicamente de tamaño (posición o cripto) Y la reducción
-    tiene sentido dentro de la estrategia de la corrida — nunca como truco
-    para colarse por debajo del límite.
+    stop-loss, universo, drawdown, state stale, cash insuficiente —
+    `amount` supera el cash disponible del state —, símbolo/posición
+    inválidos). Leer el motivo impreso en stderr, journalearlo tal cual, y
+    **acatarlo**. No reformular la orden para eludir el límite (por
+    ejemplo, no dividir una posición en varias órdenes chicas para esquivar
+    el tope del 25%). Solo tiene sentido reintentar con un monto reducido
+    si el motivo del bloqueo es específicamente de tamaño (posición,
+    cripto o cash disponible) Y la reducción tiene sentido dentro de la
+    estrategia de la corrida — nunca como truco para colarse por debajo
+    del límite.
   - `1` con mensaje **AMBIGUO**: la orden pudo haberse ejecutado igual pese
     al error (nunca se sabe con certeza del lado del cliente). **Nunca
     reintentar** ni enviar una orden equivalente. Esperar al menos 60
@@ -60,10 +62,12 @@ persistido en `state/` al inicio de cada sesión.
   riesgo igual que una posición confirmada.
 
 - Si `scripts/snapshot.py` falla, o cualquier dato necesario para decidir
-  (precio, vela, régimen) está incompleto o no se puede obtener con
-  confianza, journalear el motivo y **terminar la corrida sin operar**.
-  Ante la duda, no operar — esta es la regla de oro por encima de
-  cualquier otra.
+  (precio, vela) está incompleto o no se puede obtener con confianza,
+  journalear el motivo y **terminar la corrida sin operar**. Ante la duda,
+  no operar — esta es la regla de oro por encima de cualquier otra.
+  **Única excepción documentada:** la señal de régimen (VIX) tiene su
+  propio fallback a neutral sin abortar la corrida — ver §Señales, régimen
+  de volatilidad, para el detalle y el alcance exacto de esa excepción.
 
 ## Universo operable
 
@@ -103,6 +107,15 @@ señal, p.ej. `--count 210` para cubrir 200 días más margen).
   fuertemente ascendente = risk-off. Si no se puede obtener el dato de
   ninguna de las dos formas, **asumir régimen neutral** — nunca inventar un
   nivel de VIX.
+
+  **Excepción a la regla de oro:** si el VIX no se puede obtener, la señal
+  de régimen degrada a NEUTRAL (no se aborta la corrida). Razón: neutral ya
+  es el modo restrictivo (núcleo + 1-2 líderes, cripto a mitad de tope) y
+  todas las órdenes siguen protegidas por stop-loss y límites duros.
+  Journalear siempre "régimen: neutral por VIX no disponible". Esta
+  excepción aplica SOLO al VIX: si faltan precios/velas de un instrumento
+  del universo, ese instrumento se excluye de la corrida; si falta el
+  snapshot o el state, se aborta sin operar como siempre.
 - **Fuerza relativa sectorial:** para cada ETF sectorial del universo (XLK,
   XLE, XLF, XLV, XLI, XLP, XLU), comparar su retorno de 63 días contra el
   retorno de 63 días de SPY en el mismo período (fuerza relativa = retorno
@@ -152,8 +165,8 @@ razonamiento antes de, o en lugar de, llamar a `place_order.py`.
 ## Cierre de corrida
 
 Al terminar (haya operado o no), el agente escribe:
-- Un reporte legible en `reports/<fecha-hora>-<modo>.md` (por ejemplo
-  `reports/2026-08-04-1000-equities.md` o `reports/2026-08-04-crypto.md`),
+- Un reporte legible en `reports/<YYYY-MM-DD-HHMM>-<modo>.md` (por ejemplo
+  `reports/2026-08-04-1000-equities.md` o `reports/2026-08-04-1530-crypto.md`),
   con: régimen de mercado detectado, ranking de señales calculado,
   propuestas generadas, y para cada una si se ejecutó, se bloqueó o se
   descartó por criterio del agente — y por qué en cada caso —, más el
