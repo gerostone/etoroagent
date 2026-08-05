@@ -1,20 +1,35 @@
 #!/usr/bin/env python3
-"""Hook PreToolUse (Bash): bloquea escrituras directas a la API de eToro.
+"""Hook PreToolUse (Bash): bloquea escrituras directas a la API de eToro y
+escrituras de shell sobre los guardrails del propio agente.
 
 Defensa en profundidad: el agente de trading es Claude Code headless y
 podria, por error o por seguir instrucciones inyectadas, intentar ejecutar
 una orden por fuera de `scripts/place_order.py` (que valida los limites de
-riesgo de `scripts/risk.py`). Este hook intercepta cada tool call Bash y
-bloquea cualquier via alternativa: curl/wget/httpie contra los endpoints de
-escritura de la API, uso inline de `EtoroClient`/`requests` desde
-`python -c`/heredoc, o referencias directas a los endpoints de trading
-cuando aparecen junto a un vehiculo real de ejecucion/red.
+riesgo de `scripts/risk.py`), o reescribir sus propios guardrails (los
+scripts, la config de `.claude/`, PLAYBOOK.md, RISK.md, .env) para eludirlos
+la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
+
+  (A) Cualquier via alternativa de ESCRITURA A LA API: curl/wget/httpie
+      contra los endpoints de escritura de la API, uso inline de
+      `EtoroClient`/`requests` desde `python -c`/heredoc, o referencias
+      directas a los endpoints de trading cuando aparecen junto a un
+      vehiculo real de ejecucion/red.
+  (B) Cualquier ESCRITURA DE SHELL sobre los guardrails (`scripts/*.py`,
+      `scripts/*.sh`, `.claude/`, `PLAYBOOK.md`, `RISK.md`, `.env`):
+      `permissions.deny` en `.claude/settings.json` ya bloquea Write/Edit
+      sobre esas rutas, pero eso NO cubre escribirlas via Bash — `tee`,
+      redireccion (`>`/`>>`), `sed -i`, `mv`, `cp`, `install`, `dd of=`,
+      `truncate` o `ln` apuntando a esas rutas eluden `permissions.deny`
+      por completo (ver Task 7 / Task 10). El journaling normal del agente
+      hacia `state/` y `reports/` (que SI usa `tee`/`>>`, ver PLAYBOOK.md
+      §Cierre de corrida) sigue permitido: la regla mira el DESTINO de la
+      escritura, no la sola presencia de `tee`/`>>` en el comando.
 
 Vias de LECTURA autorizadas (no las bloquea, no necesitan caso especial:
 su invocacion normal no contiene ningun patron vigilado en el texto del
 comando): `scripts/snapshot.py` (estado del portfolio) y
-`scripts/candles.py` (velas de un simbolo). La unica via de ESCRITURA es
-`scripts/place_order.py`.
+`scripts/candles.py` (velas de un simbolo). La unica via de ESCRITURA A LA
+API es `scripts/place_order.py`.
 
 Que SI intenta cerrar este hook (ver funciones mas abajo):
   - Escrituras directas a la API (curl/wget con metodo no-GET/HEAD o con
@@ -34,6 +49,9 @@ Que SI intenta cerrar este hook (ver funciones mas abajo):
   - `requests.post/put/patch/delete(...)` (o `.post(`/`.put(`/etc. generico)
     inline dentro de `python -c`/heredoc, cuando el resultado hace
     referencia a eToro (dominio, EtoroClient, o fragmentos de endpoint).
+  - Escrituras de shell (tee/redireccion/sed -i/mv/cp/install/dd/truncate/ln)
+    cuyo DESTINO cae dentro de scripts/*.py, scripts/*.sh, .claude/,
+    PLAYBOOK.md, RISK.md o .env — ver _escribe_sobre_guardrail() mas abajo.
 
 Que NO cierra este hook (bypasses residuales aceptados, ver mas abajo).
 
@@ -49,7 +67,11 @@ este hook hace matching de texto sobre el comando tal como Claude Code lo
 pasa, SIN evaluar el shell. Cerrar todo lo de abajo requeriria evaluar
 shell real (arbitrariamente complejo, alto riesgo de falsos positivos que
 rompan corridas legitimas) — por eso quedan afuera del alcance, "cerrado
-por costo/beneficio":
+por costo/beneficio". Esto aplica por igual a la regla (A) de escritura a
+la API y a la regla (B) de escritura sobre guardrails: ninguna de las dos
+evalua el shell, asi que ambas comparten la misma superficie de bypass
+(ver tests `test_residual_aceptado_*` en `tests/test_risk_hook.py`, que
+documentan y verifican explicitamente que estos casos quedan abiertos):
   - Expansion de variables de shell para reconstruir texto en tiempo de
     ejecucion (`A=mar; B=ket-open-orders; curl .../${A}${A}${B}`... o
     simplemente `${A}${B}`): el valor real solo existe cuando bash lo
@@ -64,13 +86,15 @@ por costo/beneficio":
     ejecutarlo: este hook solo mira el texto del comando Bash, no el
     contenido de archivos escritos por otra tool call.
 Todo lo anterior se mitiga con PLAYBOOK.md (que exige que
-`scripts/place_order.py` sea la unica via de escritura) y con la
+`scripts/place_order.py` sea la unica via de escritura), con la
 validacion de riesgo INTERNA de place_order.py — que corre pase lo que
 pase por como fue invocado, no por tener acceso exclusivo a credenciales
 (las env vars ETORO_API_KEY/ETORO_USER_KEY estan disponibles para
-cualquier proceso del agente, no solo para place_order.py). Es defensa en
-profundidad, no una sandbox completa; la revision humana del journal es la
-ultima red.
+cualquier proceso del agente, no solo para place_order.py) —, y con la
+regla (B) de este mismo hook mas `permissions.deny`, que en conjunto
+cierran la via mas barata y directa de reescribir los guardrails (tee y
+redireccion simples sin ofuscacion). Es defensa en profundidad, no una
+sandbox completa; la revision humana del journal es la ultima red.
 """
 import json
 import re
@@ -87,6 +111,17 @@ MENSAJE = (
     "python -c, heredoc, eval, xargs, sh -c/bash -c). Si necesitas operar o "
     "leer datos, usa scripts/place_order.py, scripts/snapshot.py o "
     "scripts/candles.py.\n"
+)
+
+MENSAJE_GUARDRAIL = (
+    "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): los guardrails "
+    "(scripts/, .claude/, PLAYBOOK.md, RISK.md, .env) son de solo lectura "
+    "para el agente. No se permite escribirlos via Bash (tee, redireccion "
+    "> o >>, sed -i, mv, cp, install, dd, truncate, ln) — permissions.deny "
+    "ya bloquea Write/Edit sobre esas rutas, esta regla cierra la misma via "
+    "por Bash. El journaling normal hacia state/ y reports/ (tee, >>) sigue "
+    "permitido: revisa que el DESTINO del comando sea uno de esos dos "
+    "directorios, no un guardrail.\n"
 )
 
 API_DOMAIN = "public-api.etoro.com"
@@ -203,7 +238,15 @@ _ALWAYS_WRITE_RE = re.compile(r"(--json\b|--form\b|--post-data\b)", re.IGNORECAS
 
 # -F (multipart form) — SOLO mayuscula: -f minuscula es "fail silently" en
 # curl, no tiene nada que ver con form-data. Sin IGNORECASE a proposito.
+#
+# N1 (Task 10): -F por si sola NO alcanza. Un comando de otro tipo que use
+# "-F" con otro significado (p.ej. `sort -F`) y que ademas mencione el
+# dominio de la API en texto plano (p.ej. dentro de un `echo`/`printf` sin
+# ningun cliente HTTP real) daba falso positivo. Ahora exigimos que el
+# MISMO segmento tenga ademas un cliente HTTP real (curl/wget/http) — ver
+# _HTTP_CLIENT_RE — antes de contar "-F" como indicador de payload.
 _F_SHORT_RE = re.compile(r"(?:^|\s)-F(?=[\s'\"@]|$)")
+_HTTP_CLIENT_RE = re.compile(r"\b(curl|wget)\b|\bhttp\b(?!://)", re.IGNORECASE)
 
 # --data*/-d (payload) — neutralizables por -G (ver mas abajo). -d SOLO
 # minuscula: -D mayuscula es "dump headers", no data. Sin IGNORECASE.
@@ -221,7 +264,7 @@ _G_FLAG_RE = re.compile(r"(?:^|\s)-G(?=[\s'\"]|$)")
 def _tiene_payload_de_escritura(segmento: str) -> bool:
     if _ALWAYS_WRITE_RE.search(segmento):
         return True
-    if _F_SHORT_RE.search(segmento):
+    if _F_SHORT_RE.search(segmento) and _HTTP_CLIENT_RE.search(segmento):
         return True
     es_data = (
         _G_NEUTRALIZABLE_LONG_RE.search(segmento)
@@ -337,6 +380,102 @@ def _es_requests_inline_con_etoro(segmento: str) -> bool:
     return False
 
 
+# -- Escritura de shell sobre guardrails protegidos (Task 10) --------------
+#
+# `permissions.deny` en .claude/settings.json bloquea Write/Edit sobre
+# scripts/**, .claude/**, PLAYBOOK.md y RISK.md — pero SOLO para esas dos
+# tools. Nada impide que el agente use el tool Bash para lograr el mismo
+# efecto con `tee`, redireccion (`>`/`>>`), `sed -i`, `mv`, `cp`, `install`,
+# `dd of=`, `truncate` o `ln` (gap descubierto en Task 7). Esta seccion
+# cierra esa via especificamente para las rutas guardrail, SIN bloquear el
+# journaling legitimo del agente hacia `state/` y `reports/` (que tambien
+# usa estos mismos operadores — ver PLAYBOOK.md §Cierre de corrida).
+#
+# Estrategia: para cada operador de escritura encontrado en el segmento,
+# miramos solo el texto que viene DESPUES de ese operador (nunca antes: asi
+# `cat PLAYBOOK.md > reports/copy.txt` no bloquea por la lectura de
+# PLAYBOOK.md que aparece del lado izquierdo) y lo cortamos en el primer
+# limite que ya no es parte del destino de ESE operador — heredoc (`<<`),
+# redireccion de entrada (`<`), pipe (`|`) o fin de linea — para que texto
+# de OTRO comando en el mismo segmento (el cuerpo de un heredoc journaleado,
+# o un comando posterior a un pipe) no se confunda con el destino real.
+# Ejemplo concreto que esto evita (FP real de journaling): el agente hace
+# `tee -a state/journal.md <<'EOF' ... - ejecutado via scripts/place_order.py ... EOF`
+# — sin el corte en `<<`, el cuerpo del heredoc (que menciona
+# "scripts/place_order.py" como texto de la entrada del journal, no como
+# destino de escritura) bloquearia una operacion legitima.
+#
+# Esto es una aproximacion por texto, no un parser de shell: para `mv`,
+# `cp`, `install`, `ln`, `sed -i`, `dd of=` y `truncate` no distinguimos con
+# precision el argumento ORIGEN del argumento DESTINO (ambos quedan del
+# lado derecho del operador) — fail-closed deliberado: es preferible
+# bloquear de mas un `mv`/`cp` infrecuente que mencione un guardrail como
+# origen, a dejar pasar una escritura real sobre el destino. `tee` y
+# `>`/`>>` (los operadores que el agente realmente usa para journalear) SI
+# excluyen correctamente el texto anterior al operador.
+
+_TEE_RE = re.compile(r"\btee\b")
+_REDIR_RE = re.compile(r">{1,2}")
+_SED_I_RE = re.compile(r"\bsed\b[\s\S]{0,60}?-i(?:\.[\w-]+)?\b")
+_MV_RE = re.compile(r"\bmv\b")
+_CP_RE = re.compile(r"\bcp\b")
+_INSTALL_RE = re.compile(r"\binstall\b")
+_DD_OF_RE = re.compile(r"\bdd\b[\s\S]{0,60}?\bof=")
+_TRUNCATE_RE = re.compile(r"\btruncate\b")
+_LN_RE = re.compile(r"\bln\b")
+
+_OPERADORES_ESCRITURA_ARCHIVO = (
+    _REDIR_RE,
+    _TEE_RE,
+    _SED_I_RE,
+    _MV_RE,
+    _CP_RE,
+    _INSTALL_RE,
+    _DD_OF_RE,
+    _TRUNCATE_RE,
+    _LN_RE,
+)
+
+# Ademas de heredoc/pipe/newline, cortamos en puntuacion de prosa (coma,
+# parentesis, dos puntos, punto y coma) que practicamente nunca aparece
+# pegada a un argumento de archivo real en estos operadores, pero SI aparece
+# constantemente en texto natural (p.ej. un commit message o una entrada de
+# journal que describe la regla: "...ln) cuyo destino cae en scripts/x.py").
+# Sin este corte, prosa que menciona la palabra de un operador (p.ej.
+# "install") seguida en la misma linea de una ruta guardrail (mencionada
+# como texto, no como destino real) da falso positivo — bug real detectado
+# al commitear este mismo cambio (el propio mensaje de commit describia la
+# regla y quedo bloqueado por su propio patron).
+_LIMITE_OBJETIVO_RE = re.compile(r"<<|<|\||\n|[,;:()]")
+
+# Rutas guardrail: scripts/*.py y scripts/*.sh (no cualquier archivo bajo
+# scripts/, solo codigo), .claude/, PLAYBOOK.md, RISK.md, .env (y
+# .env.example, ya que contiene ".env" como substring — no es sensible en
+# si mismo pero tampoco hay ninguna razon legitima para que el agente lo
+# reescriba via Bash).
+_PROTEGIDO_RE = re.compile(
+    r"scripts/[^\s]*\.(?:py|sh)"
+    r"|\.claude/"
+    r"|PLAYBOOK\.md"
+    r"|RISK\.md"
+    r"|\.env\b"
+)
+
+
+def _region_objetivo(segmento: str, desde: int) -> str:
+    resto = segmento[desde:]
+    limite = _LIMITE_OBJETIVO_RE.search(resto)
+    return resto[: limite.start()] if limite else resto
+
+
+def _escribe_sobre_guardrail(segmento: str) -> bool:
+    for operador_re in _OPERADORES_ESCRITURA_ARCHIVO:
+        for m in operador_re.finditer(segmento):
+            if _PROTEGIDO_RE.search(_region_objetivo(segmento, m.end())):
+                return True
+    return False
+
+
 # -- Orquestacion -------------------------------------------------------
 
 
@@ -360,6 +499,18 @@ def _bloqueado(command: str) -> bool:
     return False
 
 
+def _bloqueado_guardrail(command: str) -> bool:
+    for segmento in _split_segments(command):
+        for variante in (
+            segmento,
+            _normalizar(segmento),
+            _normalizar_sin_concat(segmento),
+        ):
+            if _escribe_sobre_guardrail(variante):
+                return True
+    return False
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -375,6 +526,10 @@ def main() -> int:
     command = tool_input.get("command") or ""
     if not isinstance(command, str):
         return 0
+
+    if _bloqueado_guardrail(command):
+        sys.stderr.write(MENSAJE_GUARDRAIL)
+        return 2
 
     if _bloqueado(command):
         sys.stderr.write(MENSAJE)
