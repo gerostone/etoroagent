@@ -41,6 +41,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from etoro_api import EtoroClient  # noqa: E402
 from risk import UNIVERSE  # noqa: E402
@@ -458,12 +460,31 @@ def main():
     try:
         client = EtoroClient()
 
-        portfolios_resp = client.get_agent_portfolios()
-        portfolios = portfolios_resp.get("agentPortfolios") or []
-        if not portfolios:
-            print("no hay agent-portfolios disponibles para esta key", file=sys.stderr)
-            sys.exit(1)
-        portfolio_id = portfolios[0].get("agentPortfolioId")
+        # GET /api/v1/agent-portfolios exige scope de cuenta real:read. Un
+        # token scoped a un Agent Portfolio (el caso normal de este agente)
+        # no lo tiene y devuelve 403 -- pero GET /trading/info/real/pnl si
+        # funciona con ese token. portfolioId es puramente informativo en
+        # nuestro state (los endpoints de trading son token-scoped, no
+        # dependen de portfolioId), asi que ante 403 seguimos con un
+        # fallback en vez de abortar. 401 (EtoroAuthError, terminal) y
+        # cualquier otro HTTPError siguen abortando como antes.
+        try:
+            portfolios_resp = client.get_agent_portfolios()
+        except requests.exceptions.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            if status_code != 403:
+                raise
+            portfolio_id = os.environ.get("ETORO_PORTFOLIO_ID", "token-scoped")
+            print(
+                "listado de portfolios no accesible con este token (403); "
+                f"usando id {portfolio_id!r}"
+            )
+        else:
+            portfolios = portfolios_resp.get("agentPortfolios") or []
+            if not portfolios:
+                print("no hay agent-portfolios disponibles para esta key", file=sys.stderr)
+                sys.exit(1)
+            portfolio_id = portfolios[0].get("agentPortfolioId")
 
         pnl = client.get_pnl()
         client_portfolio = _get_client_portfolio(pnl)

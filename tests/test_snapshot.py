@@ -5,10 +5,20 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import snapshot
+from etoro_api import EtoroAuthError
 from risk import OrderRequest, validate, portfolio_value
+
+
+def _http_error(status_code):
+    """Simula el requests.exceptions.HTTPError que lanza EtoroClient.request()
+    (vía resp.raise_for_status()) para un status_code dado."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    return requests.exceptions.HTTPError(response=resp)
 
 
 # -- Fixtures -----------------------------------------------------------
@@ -644,6 +654,123 @@ def test_main_sin_portfolios_exit_1(tmp_path, monkeypatch, capsys):
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
     assert captured.err.strip() != ""
+
+
+# -- main(): 403 en listado de portfolios (token scoped al Agent Portfolio) --
+#
+# Hallazgo real contra la API: GET /api/v1/agent-portfolios exige scope de
+# cuenta real:read, que un token scoped a un Agent Portfolio no tiene (403).
+# GET /trading/info/real/pnl sí funciona con ese token. portfolioId es solo
+# informativo en nuestro state (los endpoints de trading son token-scoped,
+# no dependen de portfolioId) — por eso ante 403 podemos seguir con un
+# fallback en vez de abortar.
+
+
+def test_main_403_en_listado_portfolios_usa_fallback_token_scoped(
+    tmp_path, monkeypatch, capsys
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+    monkeypatch.delenv("ETORO_PORTFOLIO_ID", raising=False)
+
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.side_effect = _http_error(403)
+    fake_client.get_pnl.return_value = PNL_BASIC
+    fake_client.get_instruments_metadata.return_value = {
+        "items": [
+            {"instrumentId": 1, "internalSymbolFull": "SPY"},
+            {"instrumentId": 2, "internalSymbolFull": "BTC"},
+        ]
+    }
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    snapshot.main()  # no debe abortar: ni SystemExit ni ninguna excepción
+
+    written = json.loads((state_dir / "positions.json").read_text())
+    assert written["portfolioId"] == "token-scoped"
+
+    captured = capsys.readouterr()
+    assert "403" in captured.out
+    assert "token-scoped" in captured.out
+
+
+def test_main_403_en_listado_portfolios_usa_etoro_portfolio_id_del_env(
+    tmp_path, monkeypatch
+):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+    monkeypatch.setenv("ETORO_PORTFOLIO_ID", "pf-real-123")
+
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.side_effect = _http_error(403)
+    fake_client.get_pnl.return_value = PNL_BASIC
+    fake_client.get_instruments_metadata.return_value = {
+        "items": [
+            {"instrumentId": 1, "internalSymbolFull": "SPY"},
+            {"instrumentId": 2, "internalSymbolFull": "BTC"},
+        ]
+    }
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    snapshot.main()
+
+    written = json.loads((state_dir / "positions.json").read_text())
+    assert written["portfolioId"] == "pf-real-123"
+
+
+def test_main_401_en_listado_portfolios_sigue_abortando(tmp_path, monkeypatch, capsys):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.side_effect = _http_error(401)
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    with pytest.raises(SystemExit) as exc_info:
+        snapshot.main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip() != ""
+    assert not (state_dir / "positions.json").exists()
+
+
+def test_main_etoroautherror_en_listado_portfolios_sigue_abortando(tmp_path, monkeypatch):
+    # El caso real de un 401: EtoroClient.request() lo convierte en
+    # EtoroAuthError (terminal) antes de que llegue a ser un HTTPError.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.side_effect = EtoroAuthError("credenciales inválidas")
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    with pytest.raises(SystemExit) as exc_info:
+        snapshot.main()
+
+    assert exc_info.value.code == 1
+    assert not (state_dir / "positions.json").exists()
+
+
+def test_main_500_en_listado_portfolios_sigue_abortando(tmp_path, monkeypatch):
+    # Cualquier HTTPError que no sea 403 sigue abortando como antes.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(snapshot, "STATE_DIR", state_dir)
+
+    fake_client = MagicMock()
+    fake_client.get_agent_portfolios.side_effect = _http_error(500)
+    monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
+
+    with pytest.raises(SystemExit) as exc_info:
+        snapshot.main()
+
+    assert exc_info.value.code == 1
+    assert not (state_dir / "positions.json").exists()
 
 
 def test_main_ok_escribe_positions_y_equity(tmp_path, monkeypatch, capsys):
