@@ -14,13 +14,9 @@
   },
   "permissions": {
     "deny": [
-      "Write(.claude/**)",
       "Edit(.claude/**)",
-      "Write(scripts/**)",
       "Edit(scripts/**)",
-      "Write(PLAYBOOK.md)",
       "Edit(PLAYBOOK.md)",
-      "Write(RISK.md)",
       "Edit(RISK.md)"
     ]
   }
