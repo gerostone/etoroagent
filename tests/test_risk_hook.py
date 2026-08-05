@@ -686,3 +686,18 @@ def test_residual_aceptado_brace_expansion():
         "trading{/execution,X}/market{-open-orders,X}/by-amount -d '{}'"
     )
     assert r.returncode == 0
+
+
+def test_bloquea_redireccion_con_flecha_pegada_a_ruta_protegida():
+    # En bash `echo x ->f` tokeniza como `echo x - > f`: es una redireccion
+    # real. El lookbehind (?<!-) que la exceptuaba era un bypass.
+    r = run_hook("echo x ->scripts/risk.py")
+    assert r.returncode == 2
+
+
+def test_permite_flecha_dentro_de_comillas_en_reason():
+    r = run_hook(
+        '.venv/bin/python scripts/place_order.py open --symbol SPY '
+        '--amount 10 --stop-loss-pct 0.1 --reason "señal->entrada ver PLAYBOOK.md"'
+    )
+    assert r.returncode == 0

@@ -495,10 +495,10 @@ def _es_requests_inline_con_etoro(segmento: str) -> bool:
 # como origen, a dejar pasar una escritura real sobre el destino.
 
 _TEE_RE = re.compile(r"\btee\b")
-# (?<!-) excluye "->" (flecha): una '>' precedida por '-' no es redireccion.
+# Nota: "->" NO se excluye: en bash `echo x ->f` es una redireccion real a f.
 # (?!=) excluye ">=" (comparacion): una '>' seguida de '=' no es redireccion.
 # Ninguna de las dos es sintaxis de redireccion real de bash.
-_REDIR_RE = re.compile(r"(?<!-)>{1,2}(?!=)")
+_REDIR_RE = re.compile(r">{1,2}(?!=)")
 _SED_I_RE = re.compile(r"\bsed\b[\s\S]{0,60}?-i(?:\.[\w-]+)?\b")
 _MV_RE = re.compile(r"\bmv\b")
 _CP_RE = re.compile(r"\bcp\b")
