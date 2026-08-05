@@ -64,7 +64,8 @@ siempre, sin excepción:
       ambiguo. Se journalea/loguea (stderr) qué variante se usó.
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
-state/journal.md con timestamp UTC y la razón pasada por --reason.
+state/journal.md con timestamp en hora local con offset y la razón pasada
+por --reason.
 """
 import argparse
 import csv
@@ -156,7 +157,11 @@ def load_state(state_dir: Path) -> tuple:
 
 
 def journal(state_dir: Path, line: str) -> None:
-    """Appendea una línea al journal con timestamp UTC. Crea state_dir y
+    """Appendea una línea al journal con timestamp en hora LOCAL del
+    sistema y offset explícito (ej: 2026-08-05 19:03 -0300), para que el
+    journal quede legible sin conversión mental y consistente con los
+    nombres de reports/ (que scripts/runner.sh también stampea en hora
+    local — ver PLAYBOOK.md, sección Cierre de corrida). Crea state_dir y
     state_dir/journal.md si no existen — incluido el caso en que state_dir
     nunca existió (p.ej. nunca corrió snapshot.py): dejar rastro en el
     journal de un intento de orden bloqueado por falta de state vale más que
@@ -164,7 +169,7 @@ def journal(state_dir: Path, line: str) -> None:
     esto se puede escribir (permisos, disco lleno) — el caller decide si
     eso también es fatal o si el mensaje en stderr ya alcanza."""
     state_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %z")
     with open(state_dir / JOURNAL_FILE, "a") as f:
         f.write(f"- {timestamp} {line}\n")
 

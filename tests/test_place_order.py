@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -921,3 +922,33 @@ def test_close_positionid_realmente_inexistente_sigue_exit_2_tras_el_fix(tmp_pat
     )
     assert rc == 2
     client.close_position.assert_not_called()
+
+
+# -- 19: journal() timestampea en hora LOCAL con offset explicito, no UTC ---
+
+
+def test_journal_usa_hora_local_con_offset_explicito(tmp_path, monkeypatch):
+    """journal() debe escribir 'YYYY-MM-DD HH:MM +HHMM', hora local del
+    sistema con offset — no más UTC ISO. Fija el reloj a un offset conocido
+    (-03:00) para que el assert no dependa de la TZ del entorno donde
+    corren los tests."""
+
+    class _FixedNow:
+        def astimezone(self):
+            return datetime(2026, 8, 5, 19, 3, tzinfo=timezone(timedelta(hours=-3)))
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _FixedNow()
+
+    monkeypatch.setattr(place_order, "datetime", _FixedDatetime)
+
+    place_order.journal(tmp_path / "state", "linea de prueba")
+
+    line = (tmp_path / "state" / "journal.md").read_text().strip()
+    assert line == "- 2026-08-05 19:03 -0300 linea de prueba"
+    # No debe quedar en formato ISO 8601 UTC (el formato viejo, p.ej.
+    # "2026-08-05T19:03:00+00:00" o con sufijo "Z").
+    assert "T" not in line
+    assert not re.search(r"\+00:00|Z ", line)

@@ -198,6 +198,15 @@ Al terminar (haya operado o no), el agente escribe:
   propuestas generadas, y para cada una si se ejecutó, se bloqueó o se
   descartó por criterio del agente — y por qué en cada caso —, más el
   estado final del portfolio tras la corrida.
+  **Hora del reporte:** el título del reporte y todas las horas mencionadas
+  en su cuerpo deben usar la MISMA hora local del sistema que usa el
+  nombre del archivo (scripts/runner.sh stampea ese nombre con `date`,
+  hora local), con offset explícito — por ejemplo
+  `# Corrida cripto — 2026-08-05 19:03 -03`. UTC puede aparecer únicamente
+  entre paréntesis como referencia secundaria (ej:
+  `2026-08-05 19:03 -03 (22:03 UTC)`), nunca como la hora principal. Razón:
+  los nombres de archivo usan hora local; títulos en UTC confunden al
+  operador.
 - Una entrada en `state/journal.md` por **cada decisión tomada durante la
   corrida**, incluida la decisión de no operar (por ejemplo: snapshot
   fallido, análisis incompleto, régimen indeterminado, o simplemente
