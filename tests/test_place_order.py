@@ -136,7 +136,7 @@ def test_open_real_abre_posicion_con_stop_loss_por_precio(tmp_path, monkeypatch)
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(100.0)
     client.open_position_by_amount.return_value = {"positionID": 55}
@@ -159,24 +159,25 @@ def test_open_real_abre_posicion_con_stop_loss_por_precio(tmp_path, monkeypatch)
     assert "ABIERTA" in journal
 
 
-def test_open_real_tolera_key_instruments_en_search(tmp_path, monkeypatch):
+def test_open_real_no_reconoce_key_instruments_solo_items(tmp_path, monkeypatch):
+    # Verificado contra la API real: search_instrument() SOLO trae items[]
+    # (nunca "instruments") — extract_exact_match() no debe tolerar esa key
+    # alternativa que nunca existió en la respuesta real. Una respuesta con
+    # únicamente "instruments" debe tratarse como 0 matches (sin match).
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "instruments": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "instruments": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ"}]
     }
-    client.get_candles.return_value = candles_resp(100.0)
-    client.open_position_by_amount.return_value = {"positionID": 55}
     rc = place_order.main(
         ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
-    assert rc == 0
-    client.open_position_by_amount.assert_called_once_with(
-        instrument_id=42, amount_usd=20.0, stop_loss_rate=90.0
-    )
+    assert rc == 1
+    client.get_candles.assert_not_called()
+    client.open_position_by_amount.assert_not_called()
 
 
 # -- 4: close real -----------------------------------------------------------
@@ -241,7 +242,7 @@ def test_open_real_unknown_outcome_no_reintenta_y_marca_ambiguo(tmp_path, monkey
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(100.0)
     client.open_position_by_amount.side_effect = EtoroUnknownOutcomeError("body raro")
@@ -362,7 +363,13 @@ def test_state_ausente_devuelve_rc_1(tmp_path, monkeypatch):
 def _mock_client_for(symbol, instrument_id, close=100.0):
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": instrument_id, "internalSymbolFull": symbol}]
+        "items": [
+            {
+                "internalInstrumentId": instrument_id,
+                "internalSymbolFull": symbol,
+                "isHiddenFromClient": False,
+            }
+        ]
     }
     client.get_candles.return_value = candles_resp(close)
     client.open_position_by_amount.return_value = {"positionID": instrument_id}
@@ -516,7 +523,7 @@ def test_open_precio_de_vela_invalido_bloquea_sin_abrir(tmp_path, monkeypatch, b
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(bad_close)
     rc = place_order.main(
@@ -538,7 +545,7 @@ def test_open_vela_de_10_dias_bloquea_por_desactualizada(tmp_path, monkeypatch):
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     stale_from_date = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
     client.get_candles.return_value = candles_resp(100.0, from_date=stale_from_date)
@@ -558,7 +565,7 @@ def test_open_vela_sin_fromdate_bloquea(tmp_path, monkeypatch):
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {"candles": [{"candles": [{"close": 100.0}]}]}
     rc = place_order.main(
@@ -635,8 +642,8 @@ def test_open_multiples_matches_exactos_en_search_bloquea(tmp_path, monkeypatch)
     client = MagicMock()
     client.search_instrument.return_value = {
         "items": [
-            {"instrumentId": 42, "internalSymbolFull": "QQQ"},
-            {"instrumentId": 99, "internalSymbolFull": "QQQ"},
+            {"internalInstrumentId": 42, "internalSymbolFull": "QQQ"},
+            {"internalInstrumentId": 99, "internalSymbolFull": "QQQ"},
         ]
     }
     rc = place_order.main(
@@ -706,7 +713,7 @@ def test_open_btc_sin_match_exacto_resuelve_via_variante_btcusd(tmp_path, monkey
     client = MagicMock()
     client.search_instrument.side_effect = [
         {"items": []},  # "BTC" exacto: sin match
-        {"items": [{"instrumentId": 99, "internalSymbolFull": "BTCUSD"}]},  # variante
+        {"items": [{"internalInstrumentId": 99, "internalSymbolFull": "BTCUSD"}]},  # variante
     ]
     client.get_candles.return_value = candles_resp(50000.0)
     client.open_position_by_amount.return_value = {"positionID": 99}
@@ -765,3 +772,39 @@ def test_open_btc_sin_ninguna_variante_con_match_falla_igual(tmp_path, monkeypat
     assert rc == 1
     assert client.search_instrument.call_count == 3  # BTC, BTCUSD, BTC-USD
     client.open_position_by_amount.assert_not_called()
+
+
+def test_open_fuzzy_search_btca_primero_resuelve_btc_100000(tmp_path, monkeypatch):
+    # Escenario real verificado con probes en vivo: buscar "BTC" devuelve
+    # decenas de items no-exactos (aca simulados con 3) antes del match
+    # exacto "BTC" -> instrumentId 100000. Nunca debe tomarse items[0].
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": 1000.0,
+            "positions": [],
+        },
+        [("2026-08-01", 1000.0)],
+    )
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [
+            {"internalSymbolFull": "BTCA", "internalInstrumentId": 55, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTC", "internalInstrumentId": 100000, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTCB", "internalInstrumentId": 56, "isHiddenFromClient": False},
+        ]
+    }
+    client.get_candles.return_value = candles_resp(50000.0)
+    client.open_position_by_amount.return_value = {"positionID": 100000}
+    rc = place_order.main(
+        ["open", "--symbol", "BTC", "--amount", "200", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once_with(
+        instrument_id=100000, amount_usd=200.0, stop_loss_rate=45000.0
+    )

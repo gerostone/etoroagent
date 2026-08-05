@@ -7,10 +7,18 @@ risk.py (fail-closed) y place_order.py.
 HALLAZGO CRÍTICO (code review de risk.py): GET /api/v1/trading/info/real/pnl
 NO devuelve símbolos, solo instrumentID. Si escribiéramos symbol=None/"",
 risk.py bloquearía TODA apertura (fail-closed, por diseño). Por eso este
-script resuelve instrumentId -> símbolo vía get_instruments_metadata() y
-FALLA RUIDOSAMENTE (stderr + exit 1, sin escribir positions.json) si algún
-id no se puede resolver a un símbolo no vacío. Nunca se escribe un state
-con símbolos faltantes.
+script resuelve instrumentId -> símbolo y FALLA RUIDOSAMENTE (stderr + exit
+1, sin escribir positions.json) si algún id no se puede resolver a un
+símbolo no vacío. Nunca se escribe un state con símbolos faltantes.
+
+HALLAZGO (2do contacto con la API real, reemplaza el enfoque original de
+metadata): GET /market-data/instruments?instrumentIds= NO trae ticker/símbolo
+— solo instrumentDisplayDatas[] con un nombre legible ("Bitcoin"), inútil
+para resolver símbolos. La única vía real es un MAPEO INVERSO: para cada
+símbolo del universo operable cerrado (risk.UNIVERSE_EQUITY + los símbolos
+canónicos cripto de risk.CRYPTO_SEARCH_VARIANTS), buscar con
+search_instrument() + etoro_api.extract_exact_match() y armar
+instrumentId -> símbolo canónico. Ver _resolve_universe_symbol_by_id().
 
 Separación pura/IO:
   - build_state()   : pura, testeable sin red.
@@ -44,17 +52,13 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from etoro_api import EtoroClient  # noqa: E402
-from risk import UNIVERSE  # noqa: E402
+from etoro_api import EtoroClient, extract_exact_match  # noqa: E402
+from risk import CRYPTO_SEARCH_VARIANTS, UNIVERSE, UNIVERSE_EQUITY  # noqa: E402
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 POSITIONS_FILE = "positions.json"
 EQUITY_FILE = "equity.csv"
 EQUITY_HEADER = ["date", "total"]
-
-# Campos donde puede venir el símbolo en la respuesta de get_instruments_metadata,
-# probados en este orden: el primero no vacío gana.
-_SYMBOL_FIELDS = ("internalSymbolFull", "symbolFull", "symbol", "ticker")
 
 
 def _today_str() -> str:
@@ -102,10 +106,11 @@ def _normalize_instrument_id(raw):
     entrar silenciosamente al mapa id->símbolo (podría no matchear nunca con
     el id real de una posición/orden, o peor, colisionar con otro).
 
-    Se usa simétricamente en ambos lados del matching: tanto para los items
-    de get_instruments_metadata() como para el instrumentID de positions[]/
-    ordersForOpen[] en la respuesta de get_pnl() — si sólo normalizáramos un
-    lado, un id que llegara como string en el otro lado nunca matchearía.
+    Se usa simétricamente en ambos lados del matching: tanto para el
+    internalInstrumentId que devuelve search_instrument() como para el
+    instrumentID de positions[]/ordersForOpen[] en la respuesta de get_pnl()
+    — si sólo normalizáramos un lado, un id que llegara como string en el
+    otro lado nunca matchearía.
     """
     if isinstance(raw, bool):
         raise ValueError(f"instrumentId inválido (bool): {raw!r}")
@@ -368,54 +373,72 @@ def update_equity(rows: list, today: str, total: float) -> list:
     return new_rows
 
 
-def _resolve_symbol_by_id(client: EtoroClient, instrument_ids: list) -> dict:
-    """Llama a get_instruments_metadata() y arma id->símbolo.
+# Símbolos canónicos a buscar para armar el mapeo inverso id->símbolo (ver
+# _resolve_universe_symbol_by_id). NO es risk.UNIVERSE completo: ese set
+# incluye variantes de FORMATO cripto (BTCUSD, BTC-USD, BTCEUR, ...) que
+# existen solo para CLASIFICAR una posición ya resuelta contra los topes de
+# riesgo (risk.validate) — no son símbolos de búsqueda independientes.
+# Buscarlas literalmente sería redundante frente a ya resolver "BTC"/"ETH"
+# probando esas mismas variantes como intentos de búsqueda (ver
+# risk.CRYPTO_SEARCH_VARIANTS), y podría generar falsos "instrumentos
+# nuevos" si alguna variante da un match exacto distinto del canónico.
+_CANONICAL_SEARCH_SYMBOLS = sorted(UNIVERSE_EQUITY) + sorted(CRYPTO_SEARCH_VARIANTS.keys())
 
-    Para cada item busca en orden _SYMBOL_FIELDS el primer campo no vacío.
-    IDs no presentes en la respuesta simplemente no entran en el dict (y
-    build_state() fallará ruidosamente al no encontrarlos).
 
-    Tolera que la respuesta sea una lista desnuda (en vez de {"items": [...]}
-    ) — el chequeo isinstance(metadata, list) va ANTES de .get(...) porque
-    una lista no tiene .get() (AttributeError si el orden fuera al revés).
+def _resolve_universe_symbol_by_id(client: EtoroClient) -> dict:
+    """Mapeo inverso instrumentId -> símbolo CANÓNICO, buscando cada símbolo
+    del universo operable cerrado vía search_instrument() +
+    etoro_api.extract_exact_match().
 
-    Si dos items de metadata traen el mismo instrumentId, se conserva el
-    primero; si además difieren en símbolo, ValueError (metadata inconsistente
-    no debe resolverse silenciosamente a "cualquiera de los dos").
+    Reemplaza la resolución por metadata (get_instruments_metadata): esa
+    respuesta no trae ticker/símbolo, solo un nombre legible ("Bitcoin"),
+    inútil para mapear id->símbolo.
+
+    Para BTC/ETH prueba risk.CRYPTO_SEARCH_VARIANTS EN ORDEN y se queda con
+    el primer match exacto no ambiguo, mapeándolo al símbolo CANÓNICO
+    ("BTC"/"ETH"), no a la variante de búsqueda que lo encontró — así una
+    posición en el instrumento devuelto bajo "BTCUSD" sigue clasificando
+    como "BTC" para risk.py.
+
+    Best-effort por símbolo: si un símbolo del universo no resuelve (sin
+    match exacto, ambiguo, o ninguna variante cripto matchea), simplemente
+    no entra al mapa — no aborta el snapshot. El agente no necesariamente
+    tiene (ni puede tener) posiciones en cada símbolo del universo en un
+    momento dado; una posición real que SÍ referencie un instrumentID no
+    resuelto hace fallar build_state() (fail-closed) más adelante — eso es
+    lo que importa.
+
+    Si dos símbolos distintos del universo resuelven al MISMO instrumentId,
+    ValueError inmediato: eso sí es una inconsistencia de datos real (dos
+    símbolos "distintos" siendo en realidad el mismo instrumento), no un
+    símbolo simplemente no resuelto.
+
+    Se llama una sola vez por corrida de main() y el resultado se pasa a
+    build_state() — "cacheado en memoria" para toda la corrida en vez de
+    re-resolver por cada posición/orden pendiente individualmente.
+
+    Nota de rate limit: hasta ~13-19 requests a search_instrument (grupo
+    market-data, 120 req/60s) — dentro de la quota sin necesidad de sleeps.
     """
-    if not instrument_ids:
-        return {}
-    metadata = client.get_instruments_metadata(instrument_ids)
-    if isinstance(metadata, list):
-        items = metadata
-    else:
-        items = metadata.get("items") or metadata.get("instruments") or []
-
     symbol_by_id = {}
-    for item in items:
-        raw_id = item.get("instrumentId", item.get("instrumentID"))
-        if raw_id is None:
-            continue
-        instrument_id = _normalize_instrument_id(raw_id)
+    for symbol in _CANONICAL_SEARCH_SYMBOLS:
+        variants = CRYPTO_SEARCH_VARIANTS.get(symbol, [symbol])
+        for variant in variants:
+            try:
+                resp = client.search_instrument(variant)
+                match = extract_exact_match(resp, variant)
+                instrument_id = _normalize_instrument_id(match.get("internalInstrumentId"))
+            except (ValueError, TypeError):
+                continue
 
-        symbol = ""
-        for field in _SYMBOL_FIELDS:
-            val = item.get(field)
-            if val:
-                symbol = val
-                break
-        if not symbol:
-            continue
-
-        if instrument_id in symbol_by_id:
-            if symbol_by_id[instrument_id] != symbol:
+            if instrument_id in symbol_by_id and symbol_by_id[instrument_id] != symbol:
                 raise ValueError(
-                    f"metadata inconsistente para instrumentId {instrument_id}: "
-                    f"símbolos distintos ({symbol_by_id[instrument_id]!r} vs {symbol!r})."
+                    f"instrumentId {instrument_id} resuelto a dos símbolos distintos "
+                    f"del universo: {symbol_by_id[instrument_id]!r} y {symbol!r} "
+                    "(mapeo id->símbolo inconsistente, fail-closed)."
                 )
-            continue  # duplicado idéntico: nos quedamos con el primero
-
-        symbol_by_id[instrument_id] = symbol
+            symbol_by_id[instrument_id] = symbol
+            break
     return symbol_by_id
 
 
@@ -487,27 +510,11 @@ def main():
             portfolio_id = portfolios[0].get("agentPortfolioId")
 
         pnl = client.get_pnl()
-        client_portfolio = _get_client_portfolio(pnl)
-        raw_positions = client_portfolio.get("positions") or []
-        raw_orders_for_open = client_portfolio.get("ordersForOpen") or []
 
-        # Ids a resolver: posiciones reales + aperturas pendientes (mirrorID==0)
-        # — estas últimas se convierten en entradas sintéticas de positions[]
-        # dentro de build_state(), y también necesitan símbolo resuelto.
-        instrument_ids = set()
-        for p in raw_positions:
-            raw_id = p.get("instrumentID")
-            if raw_id is not None:
-                instrument_ids.add(_normalize_instrument_id_or_none(raw_id))
-        for order in raw_orders_for_open:
-            if order.get("mirrorID", 0) != 0:
-                continue
-            raw_id = order.get("instrumentID")
-            if raw_id is not None:
-                instrument_ids.add(_normalize_instrument_id_or_none(raw_id))
-        instrument_ids = sorted(instrument_ids)
-
-        symbol_by_id = _resolve_symbol_by_id(client, instrument_ids)
+        # Mapeo inverso id->símbolo sobre el universo operable cerrado (ver
+        # _resolve_universe_symbol_by_id) — reemplaza la resolución por
+        # metadata (get_instruments_metadata no trae ticker/símbolo).
+        symbol_by_id = _resolve_universe_symbol_by_id(client)
 
         state = build_state(portfolio_id, pnl, symbol_by_id)
 

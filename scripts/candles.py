@@ -46,7 +46,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from etoro_api import EtoroClient  # noqa: E402
+from etoro_api import (  # noqa: E402
+    AmbiguousMatchError,
+    EtoroClient,
+    extract_exact_match,
+)
 from risk import CRYPTO_SEARCH_VARIANTS  # noqa: E402
 
 
@@ -56,56 +60,42 @@ def make_client() -> EtoroClient:
     return EtoroClient()
 
 
-def _search_exact_matches(client, symbol: str) -> list:
-    """Devuelve los items con match EXACTO de internalSymbolFull para
-    `symbol` (0, 1 o N — el caller decide qué hacer con cada cardinalidad).
-    Tolera que la respuesta traiga los items bajo 'items' o 'instruments'."""
-    resp = client.search_instrument(symbol)
-    items = (resp.get("items") if isinstance(resp, dict) else None) or (
-        resp.get("instruments") if isinstance(resp, dict) else None
-    ) or []
-    return [
-        item
-        for item in items
-        if str(item.get("internalSymbolFull", "")).strip().upper() == symbol
-    ]
-
-
 def _resolve_instrument_id(client, symbol: str):
     """Mismo criterio que place_order.py::_resolve_instrument_id: match
-    exacto de internalSymbolFull, fail-closed ante 0 o >1 matches (una
-    ambiguedad de metadata no se resuelve arbitrariamente al primero).
+    exacto vía etoro_api.extract_exact_match(), fail-closed ante 0 o >1
+    matches (una ambigüedad no se resuelve arbitrariamente al primero).
 
     Fallback de variantes cripto (Task 10, fix reviewer): si la búsqueda
     exacta del símbolo pedido no da NINGÚN match, y el símbolo es una clave
     conocida de `risk.CRYPTO_SEARCH_VARIANTS` (eToro puede exponer el
     instrumento bajo un formato distinto, p.ej. BTCUSD en vez de BTC), se
     prueban las variantes conocidas EN ORDEN y se usa el primer match
-    EXACTO y NO AMBIGUO — una variante ambigua se descarta (no se adivina)
-    y se sigue probando con la siguiente. Un símbolo ambiguo en la búsqueda
-    ORIGINAL no dispara el fallback: sigue siendo un error inmediato, igual
-    que antes (la ambigüedad no es un problema de "formato de símbolo
+    EXACTO y NO AMBIGUO — una variante ambigua o sin match se descarta (no
+    se adivina) y se sigue probando con la siguiente. Un símbolo ambiguo en
+    la búsqueda ORIGINAL no dispara el fallback: sigue siendo un error
+    inmediato (la ambigüedad no es un problema de "formato de símbolo
     distinto", así que no tiene sentido probar variantes para resolverla).
     """
-    matches = _search_exact_matches(client, symbol)
-    if len(matches) == 1:
-        return matches[0]["instrumentId"]
-    if len(matches) > 1:
-        raise ValueError(
-            f"{len(matches)} matches exactos para {symbol} en search_instrument "
-            f"(ambiguo, no se toma el primero silenciosamente): {matches}"
-        )
+    try:
+        match = extract_exact_match(client.search_instrument(symbol), symbol)
+        return match["internalInstrumentId"]
+    except AmbiguousMatchError:
+        raise
+    except ValueError:
+        pass  # NoExactMatchError (u otro ValueError del helper): probar variantes.
 
     for variant in CRYPTO_SEARCH_VARIANTS.get(symbol, []):
         if variant == symbol:
             continue
-        variant_matches = _search_exact_matches(client, variant)
-        if len(variant_matches) == 1:
-            print(
-                f"INFO: {symbol} resuelto via variante de busqueda {variant}",
-                file=sys.stderr,
-            )
-            return variant_matches[0]["instrumentId"]
+        try:
+            match = extract_exact_match(client.search_instrument(variant), variant)
+        except ValueError:
+            continue  # sin match o ambigua en esta variante: probar la siguiente.
+        print(
+            f"INFO: {symbol} resuelto via variante de busqueda {variant}",
+            file=sys.stderr,
+        )
+        return match["internalInstrumentId"]
 
     raise ValueError(f"símbolo {symbol} no encontrado en search_instrument")
 

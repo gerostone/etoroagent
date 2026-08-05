@@ -21,6 +21,31 @@ def _http_error(status_code):
     return requests.exceptions.HTTPError(response=resp)
 
 
+def _search_side_effect(mapping):
+    """Arma un side_effect para client.search_instrument(symbol) a partir de
+    un mapping {symbol: internalInstrumentId} — forma real de la API
+    (items[] con internalSymbolFull/internalInstrumentId/isHiddenFromClient).
+    Símbolos no listados en el mapping devuelven {"items": []} (sin match,
+    tolerado por _resolve_universe_symbol_by_id — el universo entero se
+    consulta en cada corrida, no solo los símbolos que importan al test)."""
+
+    def side_effect(symbol):
+        if symbol in mapping:
+            return {
+                "items": [
+                    {
+                        "internalSymbolFull": symbol,
+                        "internalInstrumentId": mapping[symbol],
+                        "internalAssetClassName": "ETF",
+                        "isHiddenFromClient": False,
+                    }
+                ]
+            }
+        return {"items": []}
+
+    return side_effect
+
+
 # -- Fixtures -----------------------------------------------------------
 
 PNL_BASIC = {
@@ -503,69 +528,155 @@ def test_update_equity_ordena_filas_desordenadas_ascendente():
     ]
 
 
-# -- _resolve_symbol_by_id (fix #3) ------------------------------------------
+# -- _resolve_universe_symbol_by_id (2do contacto con la API real) ----------
+#
+# Reemplaza la resolución por metadata (get_instruments_metadata no trae
+# ticker/símbolo — eliminado, ver etoro_api.py). Mapeo inverso: busca cada
+# símbolo del universo operable cerrado vía search_instrument() +
+# etoro_api.extract_exact_match().
 
 
-def _fake_client_with_metadata(metadata):
+def test_resolve_universe_symbol_by_id_resuelve_equity_y_cripto_canonicos():
     client = MagicMock()
-    client.get_instruments_metadata.return_value = metadata
-    return client
+    client.search_instrument.side_effect = _search_side_effect({"SPY": 3000, "BTC": 100000})
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert symbol_by_id[3000] == "SPY"
+    assert symbol_by_id[100000] == "BTC"
 
 
-def test_resolve_symbol_by_id_con_dict_items():
-    client = _fake_client_with_metadata(
-        {"items": [{"instrumentId": 1, "internalSymbolFull": "SPY"}]}
-    )
-    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+def test_resolve_universe_symbol_by_id_busca_todo_el_universo_canonico():
+    from risk import CRYPTO_SEARCH_VARIANTS, UNIVERSE_EQUITY
+
+    client = MagicMock()
+    client.search_instrument.return_value = {"items": []}
+    snapshot._resolve_universe_symbol_by_id(client)
+    called_symbols = {c.args[0] for c in client.search_instrument.call_args_list}
+    # Cada símbolo equity del universo se buscó al menos una vez.
+    assert UNIVERSE_EQUITY.issubset(called_symbols)
+    # BTC/ETH se buscaron (al menos su primera variante, "BTC"/"ETH").
+    for canonical, variants in CRYPTO_SEARCH_VARIANTS.items():
+        assert variants[0] in called_symbols
 
 
-def test_resolve_symbol_by_id_con_lista_desnuda_no_rompe():
-    # Antes de este fix, metadata.get(...) sobre una lista lanzaba AttributeError
-    # antes de llegar al isinstance(metadata, list) — rama muerta.
-    client = _fake_client_with_metadata(
-        [{"instrumentId": 1, "internalSymbolFull": "SPY"}]
-    )
-    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+def test_resolve_universe_symbol_by_id_no_busca_variantes_cripto_como_simbolos_sueltos():
+    # risk.UNIVERSE incluye variantes de FORMATO cripto (BTCUSD, BTC-USD,
+    # ...) que existen solo para clasificar una posición ya resuelta — no
+    # deben buscarse como símbolos independientes del universo, solo como
+    # fallback de variante cuando "BTC"/"ETH" no matchean. Con ningún match
+    # (return_value uniforme), BTC agota sus 3 variantes en orden: si
+    # "BTCUSD" apareciera una SEGUNDA vez, sería porque el código itera
+    # incorrectamente sobre risk.UNIVERSE completo en vez del universo
+    # canónico (11 equity + BTC + ETH).
+    client = MagicMock()
+    client.search_instrument.return_value = {"items": []}
+    snapshot._resolve_universe_symbol_by_id(client)
+    called_symbols = [c.args[0] for c in client.search_instrument.call_args_list]
+    assert called_symbols.count("BTCUSD") == 1
+    assert called_symbols.count("BTC-USD") == 1
+    assert called_symbols.count("ETHUSD") == 1
 
 
-def test_resolve_symbol_by_id_instrumentid_string_numerico_tolerado():
-    client = _fake_client_with_metadata(
-        {"items": [{"instrumentId": "1", "internalSymbolFull": "SPY"}]}
-    )
-    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
+def test_resolve_universe_symbol_by_id_fuzzy_search_resuelve_match_exacto():
+    # El search real es FUZZY: buscar "BTC" puede devolver muchos items no
+    # exactos (p.ej. "BTCA" primero) — solo el match EXACTO gana.
+    client = MagicMock()
+
+    def side_effect(symbol):
+        if symbol == "BTC":
+            return {
+                "items": [
+                    {"internalSymbolFull": "BTCA", "internalInstrumentId": 55, "isHiddenFromClient": False},
+                    {"internalSymbolFull": "BTC", "internalInstrumentId": 100000, "isHiddenFromClient": False},
+                    {"internalSymbolFull": "BTCB", "internalInstrumentId": 56, "isHiddenFromClient": False},
+                ]
+            }
+        return {"items": []}
+
+    client.search_instrument.side_effect = side_effect
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert symbol_by_id.get(100000) == "BTC"
+    assert 55 not in symbol_by_id
+    assert 56 not in symbol_by_id
 
 
-def test_resolve_symbol_by_id_instrumentid_no_numerico_lanza_valueerror():
-    client = _fake_client_with_metadata(
-        {"items": [{"instrumentId": "no-es-un-id", "internalSymbolFull": "SPY"}]}
-    )
+def test_resolve_universe_symbol_by_id_filtra_ishiddenfromclient():
+    client = MagicMock()
+
+    def side_effect(symbol):
+        if symbol == "SPY":
+            return {
+                "items": [
+                    {"internalSymbolFull": "SPY", "internalInstrumentId": 999, "isHiddenFromClient": True},
+                ]
+            }
+        return {"items": []}
+
+    client.search_instrument.side_effect = side_effect
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert 999 not in symbol_by_id
+
+
+def test_resolve_universe_symbol_by_id_btc_via_variante_btcusd_mapea_a_canonico():
+    client = MagicMock()
+
+    def side_effect(symbol):
+        if symbol == "BTCUSD":
+            return {
+                "items": [
+                    {"internalSymbolFull": "BTCUSD", "internalInstrumentId": 777, "isHiddenFromClient": False},
+                ]
+            }
+        return {"items": []}  # "BTC" exacto: sin match
+
+    client.search_instrument.side_effect = side_effect
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert symbol_by_id.get(777) == "BTC"  # canónico, no "BTCUSD"
+
+
+def test_resolve_universe_symbol_by_id_simbolo_sin_match_no_aborta():
+    # Best-effort: un símbolo del universo sin match exacto simplemente no
+    # entra al mapa, no aborta la resolución de los demás.
+    client = MagicMock()
+    client.search_instrument.side_effect = _search_side_effect({"SPY": 3000})
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert symbol_by_id[3000] == "SPY"
+    assert len(symbol_by_id) == 1
+
+
+def test_resolve_universe_symbol_by_id_simbolo_ambiguo_no_aborta():
+    client = MagicMock()
+
+    def side_effect(symbol):
+        if symbol == "SPY":
+            return {
+                "items": [
+                    {"internalSymbolFull": "SPY", "internalInstrumentId": 1},
+                    {"internalSymbolFull": "SPY", "internalInstrumentId": 2},
+                ]
+            }
+        return {"items": []}
+
+    client.search_instrument.side_effect = side_effect
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    assert 1 not in symbol_by_id
+    assert 2 not in symbol_by_id
+
+
+def test_resolve_universe_symbol_by_id_mismo_id_dos_simbolos_distintos_lanza_valueerror():
+    client = MagicMock()
+
+    def side_effect(symbol):
+        if symbol in ("SPY", "QQQ"):
+            return {
+                "items": [
+                    {"internalSymbolFull": symbol, "internalInstrumentId": 1, "isHiddenFromClient": False}
+                ]
+            }
+        return {"items": []}
+
+    client.search_instrument.side_effect = side_effect
     with pytest.raises(ValueError):
-        snapshot._resolve_symbol_by_id(client, [1])
-
-
-def test_resolve_symbol_by_id_duplicado_mismo_simbolo_se_queda_con_primero():
-    client = _fake_client_with_metadata(
-        {
-            "items": [
-                {"instrumentId": 1, "internalSymbolFull": "SPY"},
-                {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            ]
-        }
-    )
-    assert snapshot._resolve_symbol_by_id(client, [1]) == {1: "SPY"}
-
-
-def test_resolve_symbol_by_id_duplicado_simbolo_distinto_lanza_valueerror():
-    client = _fake_client_with_metadata(
-        {
-            "items": [
-                {"instrumentId": 1, "internalSymbolFull": "SPY"},
-                {"instrumentId": 1, "internalSymbolFull": "QQQ"},
-            ]
-        }
-    )
-    with pytest.raises(ValueError):
-        snapshot._resolve_symbol_by_id(client, [1])
+        snapshot._resolve_universe_symbol_by_id(client)
 
 
 # -- _read_equity_rows: header inesperado (minor) ----------------------------
@@ -625,8 +736,8 @@ def test_main_id_no_resoluble_exit_1_y_no_escribe_positions(tmp_path, monkeypatc
         "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
     }
     fake_client.get_pnl.return_value = PNL_BASIC
-    # metadata que no resuelve ningun simbolo
-    fake_client.get_instruments_metadata.return_value = {"items": []}
+    # ningún símbolo del universo resuelve (search sin match para nada)
+    fake_client.search_instrument.return_value = {"items": []}
 
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
@@ -677,12 +788,7 @@ def test_main_403_en_listado_portfolios_usa_fallback_token_scoped(
     fake_client = MagicMock()
     fake_client.get_agent_portfolios.side_effect = _http_error(403)
     fake_client.get_pnl.return_value = PNL_BASIC
-    fake_client.get_instruments_metadata.return_value = {
-        "items": [
-            {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            {"instrumentId": 2, "internalSymbolFull": "BTC"},
-        ]
-    }
+    fake_client.search_instrument.side_effect = _search_side_effect({"SPY": 1, "BTC": 2})
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()  # no debe abortar: ni SystemExit ni ninguna excepción
@@ -706,12 +812,7 @@ def test_main_403_en_listado_portfolios_usa_etoro_portfolio_id_del_env(
     fake_client = MagicMock()
     fake_client.get_agent_portfolios.side_effect = _http_error(403)
     fake_client.get_pnl.return_value = PNL_BASIC
-    fake_client.get_instruments_metadata.return_value = {
-        "items": [
-            {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            {"instrumentId": 2, "internalSymbolFull": "BTC"},
-        ]
-    }
+    fake_client.search_instrument.side_effect = _search_side_effect({"SPY": 1, "BTC": 2})
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()
@@ -784,12 +885,7 @@ def test_main_ok_escribe_positions_y_equity(tmp_path, monkeypatch, capsys):
         "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
     }
     fake_client.get_pnl.return_value = PNL_BASIC
-    fake_client.get_instruments_metadata.return_value = {
-        "items": [
-            {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            {"instrumentId": 2, "internalSymbolFull": "BTC"},
-        ]
-    }
+    fake_client.search_instrument.side_effect = _search_side_effect({"SPY": 1, "BTC": 2})
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()
@@ -835,9 +931,7 @@ def test_main_equity_csv_usa_formula_oficial_con_ordenes_pendientes(tmp_path, mo
         "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
     }
     fake_client.get_pnl.return_value = pnl
-    fake_client.get_instruments_metadata.return_value = {
-        "items": [{"instrumentId": 7, "internalSymbolFull": "SPY"}]
-    }
+    fake_client.search_instrument.side_effect = _search_side_effect({"SPY": 7})
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()
@@ -859,12 +953,7 @@ def test_main_no_tmp_file_left_behind_on_success(tmp_path, monkeypatch):
         "agentPortfolios": [{"agentPortfolioId": "pf-1"}]
     }
     fake_client.get_pnl.return_value = PNL_BASIC
-    fake_client.get_instruments_metadata.return_value = {
-        "items": [
-            {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            {"instrumentId": 2, "internalSymbolFull": "BTC"},
-        ]
-    }
+    fake_client.search_instrument.side_effect = _search_side_effect({"SPY": 1, "BTC": 2})
     monkeypatch.setattr(snapshot, "EtoroClient", lambda: fake_client)
 
     snapshot.main()

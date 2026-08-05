@@ -1,10 +1,16 @@
 """Cliente HTTP para la API de eToro Agent Portfolios.
 
 Solo transporte: auth (x-api-key/x-user-key), x-request-id por request,
-backoff/retries ante 429, y métodos finos por endpoint (paths reales,
-verificados en docs/api-notes.md). NO contiene lógica de riesgo ni de
-negocio — eso vive en risk.py y en los scripts que consumen este cliente
+backoff/retries ante 429, y metodos finos por endpoint (paths reales,
+verificados en docs/api-notes.md). NO contiene logica de riesgo ni de
+negocio -- eso vive en risk.py y en los scripts que consumen este cliente
 (snapshot.py, place_order.py).
+
+extract_exact_match() es la excepcion deliberada a "solo transporte": es un
+helper PURO (sin red) que interpreta la forma real de la respuesta de
+search_instrument(), compartido por todos los consumidores (snapshot.py,
+place_order.py, candles.py) para no duplicar la logica de parseo en cada
+uno -- ver su docstring para el hallazgo que lo motiva.
 """
 import os
 import time
@@ -19,7 +25,7 @@ MAX_RETRY_AFTER_SECONDS = 60
 
 
 class EtoroAuthError(Exception):
-    """401 de la API: credenciales inválidas. No tiene sentido reintentar."""
+    """401 de la API: credenciales invalidas. No tiene sentido reintentar."""
 
 
 class EtoroUnknownOutcomeError(Exception):
@@ -27,9 +33,23 @@ class EtoroUnknownOutcomeError(Exception):
 
     Esto NO prueba que la orden haya fallado: un POST de apertura/cierre pudo
     haberse ejecutado igual del lado de eToro pese a este error del lado
-    cliente. Ver el docstring de EtoroClient.request() para la política de
+    cliente. Ver el docstring de EtoroClient.request() para la politica de
     no-reintento ante este y otros errores en POSTs de trading.
     """
+
+
+class NoExactMatchError(ValueError):
+    """extract_exact_match(): ningun item de search_instrument() matchea
+    EXACTO el simbolo pedido (0 matches). Subclase de ValueError -- un
+    `except ValueError` generico la sigue capturando, pero los callers que
+    necesitan distinguir "sin match" de "ambiguo" (p.ej. para el fallback de
+    variantes cripto) pueden capturarla especificamente."""
+
+
+class AmbiguousMatchError(ValueError):
+    """extract_exact_match(): mas de un item de search_instrument() matchea
+    EXACTO el simbolo pedido. Nunca se toma el primero silenciosamente --
+    una ambiguedad de instrumentId no se resuelve arbitrariamente."""
 
 
 class EtoroClient:
@@ -132,19 +152,19 @@ class EtoroClient:
     # -- Market data ---------------------------------------------------------
 
     def search_instrument(self, symbol):
-        """GET /api/v1/market-data/search — resuelve instrumentId por símbolo."""
+        """GET /api/v1/market-data/search — busca instrumentos por símbolo.
+
+        NOTA (verificado contra la API real): esta búsqueda es FUZZY, no
+        exacta — buscar "BTC" puede devolver decenas de items (p.ej. "BTCA"
+        antes que "BTC"). La respuesta trae `items[]` con `internalSymbolFull`,
+        `internalInstrumentId` (¡minúscula inicial pero NO es "instrumentId"!),
+        `internalAssetClassName`, `isHiddenFromClient`. SIEMPRE filtrar con
+        extract_exact_match() antes de usar un id — nunca tomar items[0].
+        """
         return self.request(
             "GET",
             "/api/v1/market-data/search",
             params={"internalSymbolFull": symbol},
-        )
-
-    def get_instruments_metadata(self, instrument_ids):
-        """GET /api/v1/market-data/instruments — metadata para mapear id->símbolo."""
-        return self.request(
-            "GET",
-            "/api/v1/market-data/instruments",
-            params={"instrumentIds": ",".join(str(i) for i in instrument_ids)},
         )
 
     def get_candles(self, instrument_id, *, direction="desc", interval="OneDay", count):
@@ -193,3 +213,42 @@ class EtoroClient:
             f"/api/v1/trading/execution/market-close-orders/positions/{position_id}",
             json=body,
         )
+
+
+def extract_exact_match(search_response: dict, symbol: str) -> dict:
+    """Filtra items[] de search_instrument() por match EXACTO de
+    internalSymbolFull (case-insensitive) contra symbol, excluyendo items
+    con isHiddenFromClient == True.
+
+    HALLAZGO (verificado contra la API real): el search es FUZZY -- buscar
+    "BTC" devuelve 53 items, con "BTCA" primero y el match exacto "BTC" mas
+    abajo en la lista. Tomar items[0] a ciegas resuelve el instrumentId
+    equivocado. El match exacto SI existe para los simbolos del universo
+    operable (confirmado: BTC->100000 (Crypto), SPY->3000 (ETF)).
+
+    0 matches -> NoExactMatchError ("sin match exacto").
+    >1 matches -> AmbiguousMatchError ("ambiguo") -- nunca se toma el primero
+    silenciosamente, una ambiguedad de instrumentId no se resuelve
+    arbitrariamente.
+
+    Devuelve el item (dict) con el único match exacto -- los consumidores
+    extraen `internalInstrumentId` de ahí (NO "instrumentId": ese campo no
+    existe en la respuesta real de este endpoint).
+    """
+    symbol_upper = str(symbol).strip().upper()
+    items = search_response.get("items") if isinstance(search_response, dict) else None
+    items = items or []
+    matches = [
+        item
+        for item in items
+        if str(item.get("internalSymbolFull", "")).strip().upper() == symbol_upper
+        and item.get("isHiddenFromClient") is not True
+    ]
+    if not matches:
+        raise NoExactMatchError(f"sin match exacto para {symbol!r} en search_instrument")
+    if len(matches) > 1:
+        raise AmbiguousMatchError(
+            f"{len(matches)} matches exactos para {symbol!r} en search_instrument "
+            f"(ambiguo, no se toma el primero silenciosamente): {matches}"
+        )
+    return matches[0]

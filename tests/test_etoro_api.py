@@ -7,7 +7,14 @@ import pytest
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from etoro_api import EtoroClient, EtoroAuthError, EtoroUnknownOutcomeError
+from etoro_api import (
+    AmbiguousMatchError,
+    EtoroAuthError,
+    EtoroClient,
+    EtoroUnknownOutcomeError,
+    NoExactMatchError,
+    extract_exact_match,
+)
 
 
 def make_client():
@@ -159,3 +166,105 @@ def test_200_con_body_no_json_lanza_unknown_outcome_error(mock_req):
 def test_get_candles_requiere_count():
     with pytest.raises(TypeError):
         make_client().get_candles(instrument_id=1)
+
+
+# -- extract_exact_match (2do contacto con la API real) ---------------------
+#
+# Hallazgo verificado con probes en vivo: GET /market-data/search es FUZZY —
+# buscar "BTC" devuelve 53 items, con "BTCA" primero y el match exacto "BTC"
+# más abajo en la lista. Los campos reales de cada item son
+# internalSymbolFull, internalInstrumentId (¡no "instrumentId"!),
+# internalAssetClassName, isHiddenFromClient — nunca tomar items[0] a ciegas.
+
+
+def test_extract_exact_match_devuelve_el_unico_match_exacto():
+    resp = {
+        "items": [
+            {
+                "internalSymbolFull": "SPY",
+                "internalInstrumentId": 3000,
+                "internalAssetClassName": "ETF",
+                "isHiddenFromClient": False,
+            }
+        ]
+    }
+    match = extract_exact_match(resp, "SPY")
+    assert match["internalInstrumentId"] == 3000
+
+
+def test_extract_exact_match_es_case_insensitive():
+    resp = {
+        "items": [
+            {"internalSymbolFull": "spy", "internalInstrumentId": 3000, "isHiddenFromClient": False}
+        ]
+    }
+    assert extract_exact_match(resp, "SPY")["internalInstrumentId"] == 3000
+    assert extract_exact_match(resp, "spy")["internalInstrumentId"] == 3000
+
+
+def test_extract_exact_match_sin_match_lanza_no_exact_match_error():
+    resp = {"items": [{"internalSymbolFull": "SPYX", "internalInstrumentId": 1}]}
+    with pytest.raises(NoExactMatchError):
+        extract_exact_match(resp, "SPY")
+
+
+def test_extract_exact_match_lista_vacia_lanza_no_exact_match_error():
+    with pytest.raises(NoExactMatchError):
+        extract_exact_match({"items": []}, "SPY")
+
+
+def test_extract_exact_match_ambiguo_lanza_ambiguous_match_error():
+    resp = {
+        "items": [
+            {"internalSymbolFull": "SPY", "internalInstrumentId": 3000},
+            {"internalSymbolFull": "SPY", "internalInstrumentId": 3001},
+        ]
+    }
+    with pytest.raises(AmbiguousMatchError):
+        extract_exact_match(resp, "SPY")
+
+
+def test_extract_exact_match_filtra_ishiddenfromclient():
+    resp = {
+        "items": [
+            {"internalSymbolFull": "SPY", "internalInstrumentId": 999, "isHiddenFromClient": True},
+            {"internalSymbolFull": "SPY", "internalInstrumentId": 3000, "isHiddenFromClient": False},
+        ]
+    }
+    # El item oculto no cuenta: queda un único match exacto visible, no ambiguo.
+    match = extract_exact_match(resp, "SPY")
+    assert match["internalInstrumentId"] == 3000
+
+
+def test_extract_exact_match_ishiddenfromclient_ausente_no_se_filtra():
+    # isHiddenFromClient ausente (no False explícito) no debe tratarse como
+    # oculto — solo True excluye.
+    resp = {"items": [{"internalSymbolFull": "SPY", "internalInstrumentId": 3000}]}
+    assert extract_exact_match(resp, "SPY")["internalInstrumentId"] == 3000
+
+
+def test_extract_exact_match_fuzzy_btca_primero_btc_mas_abajo_resuelve_100000():
+    # Escenario real verificado: buscar "BTC" trae muchos items no-exactos
+    # antes del match exacto (BTCA, BTCB, etc. simulados acá con 3 de 53).
+    resp = {
+        "items": [
+            {"internalSymbolFull": "BTCA", "internalInstrumentId": 55, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTCB", "internalInstrumentId": 56, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTC", "internalInstrumentId": 100000, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTCC", "internalInstrumentId": 57, "isHiddenFromClient": False},
+        ]
+    }
+    match = extract_exact_match(resp, "BTC")
+    assert match["internalInstrumentId"] == 100000
+
+
+def test_extract_exact_match_respuesta_sin_items_lanza_no_exact_match_error():
+    with pytest.raises(NoExactMatchError):
+        extract_exact_match({}, "SPY")
+
+
+def test_extract_exact_match_no_exact_match_error_es_value_error():
+    # except ValueError genérico debe seguir capturando ambas subclases —
+    # importante para callers que no necesitan distinguir el caso.
+    assert issubclass(NoExactMatchError, ValueError)
+    assert issubclass(AmbiguousMatchError, ValueError)

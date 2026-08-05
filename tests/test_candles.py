@@ -17,7 +17,7 @@ import candles  # noqa: E402
 def test_full_imprime_json_crudo_con_velas(capsys):
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "SPY"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {
         "candles": [{"candles": [{"close": 100.0, "fromDate": "2026-08-01T00:00:00Z"}]}]
@@ -43,7 +43,7 @@ def test_full_imprime_json_crudo_con_velas(capsys):
 def test_symbol_se_normaliza_a_mayusculas():
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 7, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 7, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {"candles": [{"candles": []}]}
     rc = candles.main(
@@ -57,7 +57,7 @@ def test_symbol_se_normaliza_a_mayusculas():
 def test_interval_custom_se_pasa_a_get_candles():
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 7, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 7, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {"candles": [{"candles": []}]}
     rc = candles.main(
@@ -86,7 +86,7 @@ def _candle(close, from_date):
 def test_default_imprime_csv_compacto_en_orden_ascendente(capsys):
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "SPY"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     # La API entrega en desc (nuevo -> viejo): dia 3 (mas reciente) primero.
     client.get_candles.return_value = {
@@ -120,7 +120,7 @@ def test_default_no_es_full_no_llama_json_dumps_de_velas_crudas(capsys):
     # {"symbol":..., "instrumentId":..., "candles": {...}} de --full.
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 7, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 7, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {
         "candles": [{"candles": [_candle(50.0, "2026-08-01T00:00:00Z")]}]
@@ -139,7 +139,7 @@ def test_default_no_es_full_no_llama_json_dumps_de_velas_crudas(capsys):
 def test_default_header_refleja_interval_custom_y_count_real():
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 7, "internalSymbolFull": "QQQ"}]
+        "items": [{"internalInstrumentId": 7, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {
         "candles": [
@@ -168,7 +168,7 @@ def test_default_header_refleja_interval_custom_y_count_real():
 def test_default_formato_inesperado_de_velas_falla_sin_traceback(capsys):
     client = MagicMock()
     client.search_instrument.return_value = {
-        "items": [{"instrumentId": 42, "internalSymbolFull": "SPY"}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {"algo": "inesperado"}
     rc = candles.main(["--symbol", "SPY", "--count", "10"], make_client=lambda: client)
@@ -194,8 +194,8 @@ def test_simbolo_ambiguo_falla_sin_llamar_get_candles(capsys):
     client = MagicMock()
     client.search_instrument.return_value = {
         "items": [
-            {"instrumentId": 1, "internalSymbolFull": "SPY"},
-            {"instrumentId": 2, "internalSymbolFull": "SPY"},
+            {"internalInstrumentId": 1, "internalSymbolFull": "SPY"},
+            {"internalInstrumentId": 2, "internalSymbolFull": "SPY"},
         ]
     }
     rc = candles.main(
@@ -227,7 +227,7 @@ def test_btc_sin_match_exacto_resuelve_via_variante_btcusd(capsys):
     client = MagicMock()
     client.search_instrument.side_effect = [
         {"items": []},  # "BTC" exacto: sin match
-        {"items": [{"instrumentId": 99, "internalSymbolFull": "BTCUSD"}]},  # variante
+        {"items": [{"internalInstrumentId": 99, "internalSymbolFull": "BTCUSD"}]},  # variante
     ]
     client.get_candles.return_value = {
         "candles": [{"candles": [_candle(50000.0, "2026-08-01T00:00:00Z")]}]
@@ -262,6 +262,26 @@ def test_btc_sin_ninguna_variante_con_match_falla_igual():
     # BTC + BTCUSD + BTC-USD = 3 intentos
     assert client.search_instrument.call_count == 3
     client.get_candles.assert_not_called()
+
+
+def test_fuzzy_search_btca_primero_resuelve_btc_100000():
+    # Escenario real verificado con probes en vivo: buscar "BTC" devuelve
+    # decenas de items no-exactos (aca simulados con 3) antes del match
+    # exacto "BTC" -> instrumentId 100000. Nunca debe tomarse items[0].
+    client = MagicMock()
+    client.search_instrument.return_value = {
+        "items": [
+            {"internalSymbolFull": "BTCA", "internalInstrumentId": 55, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTC", "internalInstrumentId": 100000, "isHiddenFromClient": False},
+            {"internalSymbolFull": "BTCB", "internalInstrumentId": 56, "isHiddenFromClient": False},
+        ]
+    }
+    client.get_candles.return_value = {
+        "candles": [{"candles": [_candle(50000.0, "2026-08-01T00:00:00Z")]}]
+    }
+    rc = candles.main(["--symbol", "BTC", "--count", "10"], make_client=lambda: client)
+    assert rc == 0
+    client.get_candles.assert_called_once_with(100000, interval="OneDay", count=10)
 
 
 def test_faltan_argumentos_requeridos_sale_con_error(capsys):
