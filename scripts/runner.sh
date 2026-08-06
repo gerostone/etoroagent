@@ -90,5 +90,10 @@ STAMP="$(date +%F-%H%M%S)"
 "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
   --allowedTools "Bash,Read,Write,Glob,Grep" \
   --max-turns 60 \
-  > "reports/${STAMP}-${MODE}.log" 2>&1 || echo "WARN: claude salió con código $? (ver log)"
+  > "reports/${STAMP}-${MODE}.log" 2>&1 || {
+  CLAUDE_RC=$?
+  echo "WARN: claude salió con código $CLAUDE_RC (ver log)"
+  printf -- "- %s ABORTADA | corrida %s abortada (claude exit %s) | ver reports/%s-%s.log\n" \
+    "$(date +"%Y-%m-%d %H:%M %z")" "$MODE" "$CLAUDE_RC" "$STAMP" "$MODE" >> state/journal.md
+}
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"
