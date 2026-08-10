@@ -69,10 +69,17 @@ fi
 # las variables ANTHROPIC_*/CLAUDE_* heredadas rompen la auth del CLI anidado (401).
 # Bajo launchd (entorno limpio) esto es un no-op. Se preserva CLAUDE_BIN si vino seteada.
 _CLAUDE_BIN_OVERRIDE="${CLAUDE_BIN:-}"
+# CLAUDE_CODE_OAUTH_TOKEN (de `claude setup-token`, viene de .env) se preserva:
+# es la credencial de larga duracion para headless — el login OAuth interactivo
+# expira y no se renueva sin usuario (visto: corridas 08-08 y 10-08 abortadas).
+_CLAUDE_TOKEN_OVERRIDE="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 while IFS='=' read -r _v _; do
   case "$_v" in ANTHROPIC*|CLAUDE*) unset "$_v" 2>/dev/null || true ;; esac
 done < <(env)
 CLAUDE_BIN="$_CLAUDE_BIN_OVERRIDE"
+if [ -n "$_CLAUDE_TOKEN_OVERRIDE" ]; then
+  export CLAUDE_CODE_OAUTH_TOKEN="$_CLAUDE_TOKEN_OVERRIDE"
+fi
 
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
 if [ -z "$CLAUDE_BIN" ]; then
