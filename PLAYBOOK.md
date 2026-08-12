@@ -54,7 +54,15 @@ persistido en `state/` al inicio de cada sesión.
     mismo ciclo.
 
 - Máximo 3 órdenes por corrida. Esperar al menos 3 segundos entre una orden
-  y la siguiente.
+  y la siguiente. (Este tope, y uno adicional de 6 órdenes por día
+  calendario, están además aplicados en código por `scripts/place_order.py`
+  -- ver RISK.md -- no dependen solo de que el agente los respete.)
+
+- NUNCA propongas abrir un símbolo que ya está en el portfolio (el motor lo
+  bloquea). Si ya tenés la posición y la señal sigue válida: mantener.
+  Rebalancear = cerrar en esta corrida, reevaluar en la siguiente. Si el
+  snapshot muestra que la cartera ya está posicionada según el régimen, el
+  resultado correcto de la corrida es NO operar.
 
 - Posiciones cuyo `positionId` empieza con `pending-open:` o `local-open:`
   en el state son exposición ya comprometida (apertura pendiente vista por

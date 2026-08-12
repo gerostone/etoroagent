@@ -32,6 +32,35 @@ eludir, ni pedir que se relajen para una corrida puntual.
    ejecutarse contra la API real: se journalea como simulación y termina con
    éxito (sin efectos reales). Solo con `DRY_RUN=0` explícito se ejecutan
    órdenes reales.
+6. **No-duplicación: no se recompra un símbolo con exposición existente.**
+   Si el símbolo (normalizado) de una apertura ya tiene CUALQUIER exposición
+   en el state -- una posición real, o una pendiente/local (`pending`,
+   `pending-open:`, `local-open:`) con `valueUsd` positivo --, la apertura se
+   bloquea sin excepciones, ANTES de evaluar el tope de 25% (que queda como
+   defensa en profundidad, no como primera línea). Mantener una posición
+   existente cuya señal sigue siendo válida = no recomprar; rebalancear =
+   cerrarla en la corrida actual y esperar la próxima para reabrir. Hallazgo
+   de la auditoría pre-producción que motivó esta regla: sin ella, 3
+   corridas idénticas del agente podían construir 59% de exposición real
+   donde el agente creía estar en 37%, porque el único freno (25% por
+   símbolo) frena tarde -- recién en la 3ra unidad de recompra, no en la 1ra.
+7. **Exposición agregada máxima: 70% del portfolio.** La suma de TODAS las
+   posiciones (cualquier símbolo, real o pendiente/local) más el monto de
+   una apertura nueva no puede superar el 70% del valor total del
+   portfolio (`MAX_TOTAL_EXPOSURE_PCT` en `scripts/risk.py`). Cierra el
+   hueco que dejaba el tope de 25% por símbolo solo: N símbolos distintos,
+   cada uno individualmente bajo el 25%, podían sumar una concentración
+   total sin ningún techo (3 símbolos al 25% cada uno = 75% era legal antes
+   de este tope).
+8. **Presupuesto de órdenes: máximo 3 por corrida y 6 por día.** En código
+   (no solo en prosa de PLAYBOOK.md): `scripts/place_order.py` trackea en
+   `state/.run_orders.json` cuántas órdenes se ejecutaron (dry-run, reales,
+   o de resultado ambiguo -- nunca las bloqueadas) bajo el `ETOROAGENT_RUN_ID`
+   de la corrida actual (hasta 3; `runner.sh` exporta esa variable con un id
+   distinto por corrida) y en el día calendario local (hasta 6, aplica
+   siempre, incluso sin `ETOROAGENT_RUN_ID` seteada). Agotado cualquiera de
+   los dos topes, toda apertura o cierre se bloquea (exit 2) sin llegar a la
+   API, hasta la próxima corrida o el próximo día.
 
 ## Límites adicionales (mismo nivel de exigencia)
 
