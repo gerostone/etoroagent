@@ -106,5 +106,13 @@ export ETOROAGENT_RUN_ID="${STAMP}-${MODE}"
   echo "WARN: claude salió con código $CLAUDE_RC (ver log)"
   printf -- "- %s ABORTADA | corrida %s abortada (claude exit %s) | ver reports/%s-%s.log\n" \
     "$(date +"%Y-%m-%d %H:%M %z")" "$MODE" "$CLAUDE_RC" "$STAMP" "$MODE" >> state/journal.md
+  # WP2: la corrida emitió órdenes (o pudo haberlo hecho) y murió antes de
+  # journalear el razonamiento narrativo -- dejamos un flag para que la
+  # PRÓXIMA corrida reconcilie posiciones vs journal antes de operar (ver
+  # PLAYBOOK.md §Reconciliación tras corrida abortada) y place_order.py
+  # bloquee aperturas hasta que esto se resuelva (los cierres siguen
+  # permitidos: dirección fail-safe, siempre se puede reducir riesgo).
+  printf '{\n  "reason": "corrida %s abortada (claude exit %s)",\n  "log": "reports/%s-%s.log",\n  "at": "%s"\n}\n' \
+    "$MODE" "$CLAUDE_RC" "$STAMP" "$MODE" "$(date +"%Y-%m-%d %H:%M %z")" > state/.needs_reconciliation
 }
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"

@@ -1191,3 +1191,90 @@ def test_regresion_auditoria_recompra_en_corridas_sucesivas_queda_bloqueada(tmp_
     exposicion_final = sum(p["valueUsd"] for p in on_disk_final["positions"])
     assert exposicion_final == 3700.0
     assert exposicion_final / 10_000.0 == 0.37
+
+
+# -- WP2: flag de reconciliación tras corrida abortada (state/.needs_reconciliation) --
+#
+# Auditoría pre-producción: 2 corridas emitieron órdenes y murieron (corte
+# de conexión con la API de Anthropic) ANTES de journalear el razonamiento
+# narrativo. scripts/runner.sh crea state/.needs_reconciliation cuando esto
+# pasa (claude exit != 0) -- ver tests/test_runner.py. Acá se cubre el lado
+# de place_order.py: mientras el flag exista, las APERTURAS se bloquean
+# (exit 2, sin tocar el cliente HTTP); los CIERRES siguen permitidos
+# siempre -- reducir riesgo nunca debe esperar a una reconciliación.
+
+
+def test_open_con_flag_de_reconciliacion_bloquea_sin_llamar_cliente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    (state_dir / ".needs_reconciliation").write_text(
+        json.dumps({"reason": "corrida equities abortada (claude exit 1)"})
+    )
+
+    client = MagicMock()
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 2
+    client.search_instrument.assert_not_called()
+    client.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "BLOQUEADA" in journal
+    assert "reconciliaci" in journal
+    assert "RECONCILIACION" in journal
+    assert "state/.needs_reconciliation" in journal
+
+
+def test_close_con_flag_de_reconciliacion_permitido(tmp_path, monkeypatch):
+    """Los cierres son la dirección fail-safe (reducir riesgo): deben seguir
+    funcionando aunque haya una reconciliación pendiente."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [
+            {"positionId": "pos-9", "symbol": "QQQ", "instrumentId": 7, "valueUsd": 50.0},
+        ],
+    }
+    state_dir = write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    (state_dir / ".needs_reconciliation").write_text(
+        json.dumps({"reason": "corrida crypto abortada (claude exit 1)"})
+    )
+
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "QQQ"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.close_position.assert_called_once()
+    journal = (state_dir / "journal.md").read_text()
+    assert "CERRADA" in journal
+
+
+def test_borrar_flag_de_reconciliacion_rehabilita_aperturas(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    flag_path = state_dir / ".needs_reconciliation"
+    flag_path.write_text(json.dumps({"reason": "corrida equities abortada (claude exit 1)"}))
+
+    rc_blocked = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: MagicMock(),
+    )
+    assert rc_blocked == 2
+
+    # El operador reconcilia y borra el flag (PLAYBOOK.md §Reconciliación
+    # tras corrida abortada, paso 4) -- la próxima apertura debe pasar.
+    flag_path.unlink()
+    rc, client = _open_ok(state_dir, "QQQ", instrument_id=7)
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()

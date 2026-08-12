@@ -76,6 +76,17 @@ siempre, sin excepción:
       sea por riesgo o por este mismo presupuesto) NUNCA consumen
       presupuesto. Escritura atómica (tmp + os.replace), mismo patrón que
       _atomic_write_json().
+  16. Flag de reconciliación (WP2, auditoría pre-producción: se detectaron
+      corridas que emiten órdenes y mueren -- corte de conexión con la API
+      de Anthropic -- ANTES de journalear el razonamiento narrativo).
+      Si existe state/.needs_reconciliation (creado por scripts/runner.sh
+      cuando `claude` sale con código != 0), se bloquean las APERTURAS
+      (exit 2) hasta que el operador reconcilie posiciones reales vs
+      journal y borre el archivo -- ver PLAYBOOK.md §Reconciliación tras
+      corrida abortada. Los CIERRES siguen permitidos siempre: reducir
+      riesgo nunca debe esperar a una reconciliación (dirección
+      fail-safe). Se chequea ANTES de despachar a _handle_open/_handle_close,
+      igual que el presupuesto de órdenes (regla 15).
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp en hora local con offset y la razón pasada
@@ -103,6 +114,14 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 POSITIONS_FILE = "positions.json"
 EQUITY_FILE = "equity.csv"
 JOURNAL_FILE = "journal.md"
+# WP2 (auditoria pre-produccion): runner.sh crea este flag cuando una
+# corrida muere (claude exit != 0) DESPUES de haber podido emitir
+# ordenes pero ANTES de journalear el razonamiento narrativo -- ver su
+# docstring en scripts/runner.sh. Mientras exista, main() bloquea
+# aperturas (no cierres, ver mas abajo) hasta que el operador reconcilie
+# posiciones reales vs journal y borre el archivo (PLAYBOOK.md
+# §Reconciliacion tras corrida abortada).
+NEEDS_RECONCILIATION_FILE = ".needs_reconciliation"
 
 CANDLE_MAX_AGE_DAYS = 5
 STATE_MAX_AGE_HOURS = 24
@@ -752,6 +771,21 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
             state_dir, f"BLOQUEADA | {args.action} | {budget_block_msg} | razon={args.reason}"
         )
         print(f"BLOQUEADA: {budget_block_msg}", file=sys.stderr)
+        return 2
+
+    # WP2: reconciliacion pendiente tras una corrida abortada -- ver el
+    # comentario de NEEDS_RECONCILIATION_FILE mas arriba y PLAYBOOK.md
+    # §Reconciliacion tras corrida abortada. Solo bloquea
+    # aperturas: los cierres (reducir riesgo) siguen permitidos siempre.
+    if args.action == "open" and (state_dir / NEEDS_RECONCILIATION_FILE).exists():
+        recon_msg = (
+            "reconciliaci\u00f3n pendiente tras corrida abortada: revis\u00e1 posiciones vs "
+            "journal, journale\u00e1 RECONCILIACION y elimin\u00e1 state/.needs_reconciliation"
+        )
+        journal(
+            state_dir, f"BLOQUEADA | {args.action} | {recon_msg} | razon={args.reason}"
+        )
+        print(f"BLOQUEADA: {recon_msg}", file=sys.stderr)
         return 2
 
     if args.action == "open":
