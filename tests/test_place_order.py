@@ -975,3 +975,219 @@ def test_journal_usa_hora_local_con_offset_explicito(tmp_path, monkeypatch):
     # "2026-08-05T19:03:00+00:00" o con sufijo "Z").
     assert "T" not in line
     assert not re.search(r"\+00:00|Z ", line)
+
+
+# -- WP1: presupuesto de órdenes por corrida y por día (state/.run_orders.json) ---
+#
+# Auditoría pre-producción: "el tope de 3 órdenes/corrida vive solo en
+# prosa" (PLAYBOOK.md), sin nada en código que lo haga cumplir. Este bloque
+# cubre el presupuesto en código: máx MAX_ORDERS_PER_RUN por
+# ETOROAGENT_RUN_ID, máx MAX_ORDERS_PER_DAY por día calendario (aplica
+# siempre, con o sin ETOROAGENT_RUN_ID). Los BLOQUEOS (exit 2, sea por
+# riesgo o por presupuesto) no consumen presupuesto; las órdenes
+# ejecutadas (dry-run u real) y las de resultado AMBIGUO sí.
+
+
+def _big_state_dir(tmp_path, cash=1_000_000.0):
+    """Portfolio grande y sin posiciones previas: aísla los tests de
+    presupuesto de cualquier interacción con los topes de riesgo (25%,
+    70% agregado, no-duplicación) al usar un símbolo distinto por orden."""
+    return write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": cash,
+            "positions": [],
+        },
+        [("2026-08-01", cash)],
+    )
+
+
+# Símbolos distintos del universo para no chocar con la regla de
+# no-duplicación al hacer varias aperturas seguidas en los tests de abajo.
+_BUDGET_SYMBOLS = ["SPY", "QQQ", "XLK", "XLE", "XLF", "XLV", "XLI", "XLP", "XLU"]
+
+
+def _open_ok(state_dir, symbol, instrument_id=1, amount=10.0):
+    client = _mock_client_for(symbol, instrument_id, close=100.0)
+    rc = place_order.main(
+        ["open", "--symbol", symbol, "--amount", str(amount), "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    return rc, client
+
+
+def test_cuarta_orden_mismo_run_id_bloquea_sin_llamar_cliente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "2026-08-12-100000-equities")
+    state_dir = _big_state_dir(tmp_path)
+
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    client4 = MagicMock()
+    rc4 = place_order.main(
+        ["open", "--symbol", _BUDGET_SYMBOLS[3], "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client4,
+    )
+    assert rc4 == 2
+    client4.search_instrument.assert_not_called()
+    client4.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "tope de 3 órdenes por corrida" in journal
+
+
+def test_run_id_nuevo_resetea_presupuesto_de_corrida(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-A")
+    state_dir = _big_state_dir(tmp_path)
+
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    # Bajo el mismo run-A, una 4ta orden se bloquearía (ver test anterior).
+    # Cambiar ETOROAGENT_RUN_ID a un valor nuevo (como haría runner.sh en la
+    # siguiente corrida, con un STAMP distinto) debe resetear el contador.
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-B")
+    rc, client = _open_ok(state_dir, _BUDGET_SYMBOLS[3], instrument_id=3)
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+def test_septima_orden_del_dia_bloquea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    state_dir = _big_state_dir(tmp_path)
+
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:6]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    client7 = MagicMock()
+    rc7 = place_order.main(
+        ["open", "--symbol", _BUDGET_SYMBOLS[6], "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client7,
+    )
+    assert rc7 == 2
+    client7.search_instrument.assert_not_called()
+    client7.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "presupuesto diario" in journal
+
+
+def test_sin_run_id_solo_aplica_el_limite_diario(tmp_path, monkeypatch):
+    # Sin ETOROAGENT_RUN_ID (invocación manual): el tope de 3 por corrida NO
+    # se aplica -- una 4ta orden manual sigue pasando (solo el diario, de 6,
+    # podría eventualmente bloquear).
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    state_dir = _big_state_dir(tmp_path)
+
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:4]):
+        rc, client = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+        client.open_position_by_amount.assert_called_once()
+
+
+def test_bloqueo_por_riesgo_no_consume_presupuesto(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-riesgo")
+    state_dir = _big_state_dir(tmp_path)
+
+    client_blocked = MagicMock()
+    # stop-loss > 12% -> bloqueado por risk.validate(), no llega a client.
+    rc_blocked = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.50"],
+        state_dir=state_dir,
+        make_client=lambda: client_blocked,
+    )
+    assert rc_blocked == 2
+    client_blocked.search_instrument.assert_not_called()
+
+    # Si el bloqueo hubiera consumido presupuesto, la 3ra orden de acá abajo
+    # ya estaría en la 4ta posición del contador y se bloquearía. Deben
+    # pasar las 3, exactamente al tope de MAX_ORDERS_PER_RUN.
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, client = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0, f"orden {i} ({symbol}) debería pasar: presupuesto no debía estar consumido"
+
+
+# -- REGRESIÓN CRÍTICA: escenario de la auditoría (recompra en corridas sucesivas) --
+
+
+def test_regresion_auditoria_recompra_en_corridas_sucesivas_queda_bloqueada(tmp_path, monkeypatch):
+    """Replica el hallazgo central de la auditoría pre-producción: 3
+    corridas IDÉNTICAS del agente (misma propuesta: abrir XLV 1500, XLF
+    1200, XLK 1000 sobre un portfolio de ~10000) construían, antes de WP1,
+    59% de exposición real acumulada, mientras el agente -- que solo veía
+    el 25% por símbolo como freno -- creía estar en 37%. Con la regla de
+    no-duplicación, la corrida 2 (y la 3) deben quedar TOTALMENTE
+    bloqueadas: la exposición final tiene que ser 37% (3700/10000), nunca
+    59%.
+
+    El registro de exposición intra-corrida usado acá es el MISMO camino
+    real que usaría place_order.py en producción
+    (_register_local_exposure vía un open exitoso, regla 8 del módulo) --
+    no se simula el state a mano."""
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path, cash=10_000.0)
+
+    ordenes = [("XLV", 1500.0, 10), ("XLF", 1200.0, 11), ("XLK", 1000.0, 12)]
+
+    # --- Corrida 1: las 3 aperturas pasan (nada previo del mismo símbolo) ---
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "2026-08-10-100000-equities")
+    for symbol, amount, instrument_id in ordenes:
+        rc, client = _open_ok(state_dir, symbol, instrument_id=instrument_id, amount=amount)
+        assert rc == 0, f"corrida 1, {symbol}: debería abrir"
+        client.open_position_by_amount.assert_called_once()
+
+    on_disk = json.loads((state_dir / "positions.json").read_text())
+    assert len(on_disk["positions"]) == 3
+    assert on_disk["cashUsd"] == 10_000.0 - 1500.0 - 1200.0 - 1000.0  # 6300.0
+    exposicion_tras_corrida_1 = sum(p["valueUsd"] for p in on_disk["positions"])
+    assert exposicion_tras_corrida_1 == 3700.0  # 37% de 10000
+
+    # --- Corrida 2: MISMA propuesta -- debe quedar TODA bloqueada por no-duplicación ---
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "2026-08-11-100000-equities")
+    for symbol, amount, instrument_id in ordenes:
+        client = MagicMock()
+        rc = place_order.main(
+            ["open", "--symbol", symbol, "--amount", str(amount), "--stop-loss-pct", "0.10"],
+            state_dir=state_dir,
+            make_client=lambda: client,
+        )
+        assert rc == 2, f"corrida 2, {symbol}: debería bloquearse por no-duplicación"
+        client.search_instrument.assert_not_called()
+        client.open_position_by_amount.assert_not_called()
+
+    on_disk_tras_corrida_2 = json.loads((state_dir / "positions.json").read_text())
+    assert len(on_disk_tras_corrida_2["positions"]) == 3  # sin cambios: nada se agregó
+    exposicion_tras_corrida_2 = sum(p["valueUsd"] for p in on_disk_tras_corrida_2["positions"])
+    assert exposicion_tras_corrida_2 == 3700.0
+    assert exposicion_tras_corrida_2 / 10_000.0 == 0.37  # nunca 59%
+
+    journal = (state_dir / "journal.md").read_text()
+    assert journal.count("no-duplicaci") >= 3
+
+    # --- Corrida 3: mismo resultado -- confirma que no es un fluke de la corrida 2 ---
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "2026-08-12-100000-equities")
+    for symbol, amount, instrument_id in ordenes:
+        client = MagicMock()
+        rc = place_order.main(
+            ["open", "--symbol", symbol, "--amount", str(amount), "--stop-loss-pct", "0.10"],
+            state_dir=state_dir,
+            make_client=lambda: client,
+        )
+        assert rc == 2, f"corrida 3, {symbol}: debería bloquearse por no-duplicación"
+        client.open_position_by_amount.assert_not_called()
+
+    on_disk_final = json.loads((state_dir / "positions.json").read_text())
+    exposicion_final = sum(p["valueUsd"] for p in on_disk_final["positions"])
+    assert exposicion_final == 3700.0
+    assert exposicion_final / 10_000.0 == 0.37

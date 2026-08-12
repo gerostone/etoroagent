@@ -94,6 +94,10 @@ PROMPT_FILE="prompts/run_${MODE}.md"
 [ -s "$PROMPT_FILE" ] || { echo "ERROR: falta o está vacío $PROMPT_FILE" >&2; exit 1; }
 
 STAMP="$(date +%F-%H%M%S)"
+# WP1: presupuesto de órdenes por corrida (state/.run_orders.json, ver
+# scripts/place_order.py) se trackea por ETOROAGENT_RUN_ID -- una corrida
+# real de principio a fin, no un proceso individual de place_order.py.
+export ETOROAGENT_RUN_ID="${STAMP}-${MODE}"
 "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
   --allowedTools "Bash,Read,Write,Glob,Grep" \
   --max-turns 60 \

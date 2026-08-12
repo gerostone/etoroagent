@@ -62,6 +62,20 @@ siempre, sin excepción:
       se reintenta con las variantes de formato conocidas (p.ej. BTCUSD para
       BTC) en orden, usando la primera variante con match exacto y no
       ambiguo. Se journalea/loguea (stderr) qué variante se usó.
+  15. Presupuesto de órdenes en código (WP1, auditoría pre-producción: antes
+      "máximo 3 órdenes por corrida" vivía solo en PLAYBOOK.md, en prosa, sin
+      nada que lo hiciera cumplir). state/.run_orders.json trackea dos
+      contadores: por ETOROAGENT_RUN_ID (env var que runner.sh exporta por
+      corrida) hasta MAX_ORDERS_PER_RUN, y por día calendario (hora local)
+      hasta MAX_ORDERS_PER_DAY -- este último aplica SIEMPRE, incluso en
+      invocaciones manuales sin ETOROAGENT_RUN_ID seteada (ahí el tope por
+      corrida no se evalúa). Se chequea ANTES de abrir o cerrar (open y
+      close); si cualquiera de los dos topes está agotado, exit 2 sin tocar
+      el cliente HTTP. Se incrementa SOLO al ejecutar efectivamente una
+      orden (dry-run, real, o de resultado AMBIGUO) -- los bloqueos (exit 2,
+      sea por riesgo o por este mismo presupuesto) NUNCA consumen
+      presupuesto. Escritura atómica (tmp + os.replace), mismo patrón que
+      _atomic_write_json().
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp en hora local con offset y la razón pasada
@@ -181,6 +195,109 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
+
+
+# -- Presupuesto de órdenes por corrida y por día (WP1) ---------------------
+#
+# Auditoría pre-producción: "máximo 3 órdenes por corrida" vivía solo en
+# PLAYBOOK.md (prosa), sin nada en código que lo hiciera cumplir. Acá se
+# aplica en código, con dos contadores independientes en un único archivo:
+#   - "count"/"runId": por ETOROAGENT_RUN_ID (una corrida real del agente,
+#     ver runner.sh). Solo se evalúa/incrementa si la env var está seteada.
+#   - "dailyCount"/"date": por día calendario LOCAL (mismo criterio que
+#     journal(), para quedar legible junto al resto de los timestamps).
+#     Aplica siempre, con o sin ETOROAGENT_RUN_ID.
+ORDER_BUDGET_FILE = ".run_orders.json"
+MAX_ORDERS_PER_RUN = 3
+MAX_ORDERS_PER_DAY = 6
+
+
+def _today_local() -> str:
+    """Fecha calendario LOCAL del sistema (no UTC) -- mismo criterio que
+    journal(), para que el corte de "día" del presupuesto coincida con el
+    día que ve un humano leyendo el journal/los nombres de reports/."""
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+
+def _load_order_budget(state_dir: Path) -> dict:
+    """Lee state/.run_orders.json. Fail-safe (no fail-closed): archivo
+    ausente, corrupto, o con campos de tipo inesperado -> presupuesto
+    "vacío" (contadores en 0), nunca una excepción -- un presupuesto
+    ilegible no debe tumbar toda la corrida, a diferencia de positions.json
+    (regla de negocio distinta: esto es un contador operativo, no el
+    estado real del portfolio)."""
+    default = {"runId": None, "count": 0, "date": None, "dailyCount": 0}
+    path = state_dir / ORDER_BUDGET_FILE
+    if not path.exists():
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    count = data.get("count", 0)
+    daily_count = data.get("dailyCount", 0)
+    return {
+        "runId": data.get("runId"),
+        "count": count if isinstance(count, int) and not isinstance(count, bool) else 0,
+        "date": data.get("date"),
+        "dailyCount": (
+            daily_count
+            if isinstance(daily_count, int) and not isinstance(daily_count, bool)
+            else 0
+        ),
+    }
+
+
+def _normalize_order_budget(budget: dict, run_id, today: str) -> dict:
+    """Resetea (SIN persistir -- ver _check_order_budget/_consume_order_budget)
+    el contador por corrida si cambió el ETOROAGENT_RUN_ID, y el contador
+    diario si cambió la fecha calendario local. Si run_id es None (invocación
+    manual), el contador por corrida NO se toca -- ese caso no participa del
+    tope por corrida en absoluto (ver _check_order_budget)."""
+    budget = dict(budget)
+    if run_id is not None and budget.get("runId") != run_id:
+        budget["runId"] = run_id
+        budget["count"] = 0
+    if budget.get("date") != today:
+        budget["date"] = today
+        budget["dailyCount"] = 0
+    return budget
+
+
+def _save_order_budget(state_dir: Path, budget: dict) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(state_dir / ORDER_BUDGET_FILE, budget)
+
+
+def _check_order_budget(state_dir: Path) -> str:
+    """Solo lectura: no incrementa ni persiste nada (eso es
+    _consume_order_budget, llamado recién cuando una orden se ejecuta de
+    verdad). Devuelve un mensaje de bloqueo si el presupuesto por corrida
+    (con ETOROAGENT_RUN_ID seteada) o el diario (siempre) está agotado, o
+    "" si hay presupuesto disponible."""
+    run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
+    budget = _normalize_order_budget(_load_order_budget(state_dir), run_id, _today_local())
+
+    if run_id is not None and budget["count"] >= MAX_ORDERS_PER_RUN:
+        return f"tope de {MAX_ORDERS_PER_RUN} órdenes por corrida alcanzado"
+    if budget["dailyCount"] >= MAX_ORDERS_PER_DAY:
+        return f"presupuesto diario de {MAX_ORDERS_PER_DAY} órdenes agotado"
+    return ""
+
+
+def _consume_order_budget(state_dir: Path) -> None:
+    """Incrementa el presupuesto tras UNA orden efectivamente ejecutada
+    (dry-run, real, o de resultado AMBIGUO -- ver docstring del módulo,
+    regla 15). Los bloqueos (exit 2) nunca llegan a llamar esto."""
+    run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
+    budget = _normalize_order_budget(_load_order_budget(state_dir), run_id, _today_local())
+    if run_id is not None:
+        budget["count"] = budget["count"] + 1
+    budget["dailyCount"] = budget["dailyCount"] + 1
+    _save_order_budget(state_dir, budget)
 
 
 def _register_local_exposure(
@@ -403,6 +520,7 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
             f"| razon={args.reason}",
         )
         print(f"DRY_RUN: no se ejecuta open {symbol} amount={amount}")
+        _consume_order_budget(state_dir)
         return 0
 
     try:
@@ -464,6 +582,7 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
             f"antes de reintentar: {exc}",
             file=sys.stderr,
         )
+        _consume_order_budget(state_dir)
         return 1
 
     _safe_register_local_exposure(state_dir, state, symbol, instrument_id, amount)
@@ -473,6 +592,7 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         f"stop_loss_rate={stop_loss_rate} resultado={result} | razon={args.reason}",
     )
     print(f"ABIERTA: {symbol} amount={amount} stop_loss_rate={stop_loss_rate}")
+    _consume_order_budget(state_dir)
     return 0
 
 
@@ -544,6 +664,7 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
             f"| razon={args.reason}",
         )
         print(f"DRY_RUN: no se ejecuta close {position_id} {symbol}")
+        _consume_order_budget(state_dir)
         return 0
 
     try:
@@ -572,6 +693,7 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
             f"reintentar: {exc}",
             file=sys.stderr,
         )
+        _consume_order_budget(state_dir)
         return 1
 
     journal(
@@ -580,6 +702,7 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
         f"resultado={result} | razon={args.reason}",
     )
     print(f"CERRADA: {position_id} {symbol}")
+    _consume_order_budget(state_dir)
     return 0
 
 
@@ -617,6 +740,18 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
     if staleness_msg:
         journal(state_dir, f"BLOQUEADA | {args.action} | {staleness_msg} | razon={args.reason}")
         print(f"BLOQUEADA: {staleness_msg}", file=sys.stderr)
+        return 2
+
+    # WP1: presupuesto de órdenes (por corrida y/o diario, ver docstring del
+    # módulo, regla 15) -- se evalúa para open Y close, ANTES de despachar,
+    # para que un bloqueo acá jamás llegue a tocar el cliente HTTP ni,
+    # crucialmente, a consumir presupuesto él mismo.
+    budget_block_msg = _check_order_budget(state_dir)
+    if budget_block_msg:
+        journal(
+            state_dir, f"BLOQUEADA | {args.action} | {budget_block_msg} | razon={args.reason}"
+        )
+        print(f"BLOQUEADA: {budget_block_msg}", file=sys.stderr)
         return 2
 
     if args.action == "open":
