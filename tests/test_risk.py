@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from risk import (
     CRYPTO_SEARCH_VARIANTS,
+    MAX_TOTAL_EXPOSURE_PCT,
     OrderRequest,
     validate,
     drawdown_pct,
@@ -61,9 +62,13 @@ def test_orden_valida_pasa():
 
 
 def test_bloquea_posicion_mayor_25pct():
-    # SPY ya tiene 60 (30%); sumar cualquier monto la deja > 25% → bloquear
+    # SPY ya tiene 60 (30%); con la regla de no-duplicación (WP1) cualquier
+    # recompra de un símbolo con exposición existente se bloquea ANTES de
+    # llegar al tope de 25% — ver test_no_duplicacion_precede_al_tope_25pct
+    # y test_bloquea_nueva_posicion_que_supera_25pct para el caso puro de
+    # 25% sobre un símbolo sin posición previa.
     ok, msg = validate(open_order(symbol="SPY", amount=10.0), STATE, EQUITY_OK)
-    assert not ok and "25%" in msg
+    assert not ok and "no-duplicaci" in msg.lower()
 
 
 def test_bloquea_nueva_posicion_que_supera_25pct():
@@ -120,9 +125,11 @@ def test_symbol_minuscula_en_state_se_normaliza_y_sigue_bloqueando():
             {"symbol": "btc", "valueUsd": 40.0},
         ],
     }
-    # "spy" en minúscula debe normalizarse a "SPY" y seguir contando como 30% ya invertido
+    # "spy" en minúscula debe normalizarse a "SPY" y seguir reconociéndose
+    # como exposición existente — ahora bloqueada por no-duplicación (WP1)
+    # antes de llegar al tope de 25%.
     ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
-    assert not ok and "25%" in msg
+    assert not ok and "no-duplicaci" in msg.lower()
 
 
 def test_state_sin_positions_bloquea_open():
@@ -173,7 +180,15 @@ def test_bloquea_equity_con_nan_en_ultima_fila_pese_a_drawdown_real_alto():
 
 
 def test_limite_posicion_exacto_25pct_pasa():
-    ok, msg = validate(open_order(amount=50.0), STATE, EQUITY_OK)  # 50/200 = 25% exacto
+    # Estado dedicado (en vez de STATE global, que ya tiene 50% de exposición
+    # existente) para aislar el tope de 25% por posición del tope de 70%
+    # agregado (WP1): 50/200 = 25% exacto sobre un símbolo nuevo, con
+    # exposición previa total baja (25%) para no chocar con el 70%.
+    state = {
+        "cashUsd": 150.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 50.0}],
+    }  # total = 200
+    ok, msg = validate(open_order(amount=50.0), state, EQUITY_OK)  # 50/200 = 25% exacto
     assert ok, msg
 
 
@@ -319,5 +334,125 @@ def test_bloquea_simbolo_fuera_del_universo_operable():
 def test_permite_simbolos_del_universo_equity_y_cripto():
     ok, msg = validate(open_order(symbol="QQQ", amount=10.0), STATE, EQUITY_OK)
     assert ok, msg
-    ok2, msg2 = validate(open_order(symbol="BTC", amount=10.0), STATE, EQUITY_OK)
+    # ETH (no BTC: STATE ya tiene una posición BTC, y WP1 bloquearía esa
+    # recompra por no-duplicación antes de llegar a esta validación de
+    # universo) — sigue cubriendo el caso "símbolo cripto del universo".
+    ok2, msg2 = validate(open_order(symbol="ETH", amount=10.0), STATE, EQUITY_OK)
     assert ok2, msg2
+
+
+# --- WP1: no-duplicación de símbolos ----------------------------------------
+#
+# Auditoría pre-producción: corridas sucesivas recompraban símbolos ya
+# tenidos porque el único freno (25% por símbolo) frena tarde — 3 corridas
+# idénticas podían construir 59% de exposición real donde el agente creía
+# 37%. La regla de no-duplicación bloquea CUALQUIER open sobre un símbolo
+# que ya tenga exposición (real o pending/local, valueUsd>0), sin
+# excepciones, ANTES del tope de 25% (que queda como defensa en
+# profundidad, no como primera línea).
+
+
+def test_bloquea_open_simbolo_con_posicion_real_existente():
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 100.0}],
+    }
+    ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
+    assert not ok and "no-duplicaci" in msg.lower()
+
+
+def test_bloquea_open_simbolo_con_posicion_pending_existente():
+    # Exposición "pending" (aperturas pendientes del snapshot, o exposición
+    # local registrada por place_order.py tras un open exitoso/ambiguo en
+    # la misma corrida) cuenta igual que una posición confirmada.
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 100.0, "pending": True}],
+    }
+    ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
+    assert not ok and "no-duplicaci" in msg.lower()
+
+
+def test_no_duplicacion_precede_al_tope_25pct_en_el_mensaje():
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 100.0}],
+    }
+    ok, msg = validate(open_order(symbol="SPY", amount=500.0), state, EQUITY_OK)
+    assert not ok
+    assert "no-duplicaci" in msg.lower()
+    assert "25%" not in msg
+
+
+def test_permite_open_simbolo_nuevo_sin_posicion_previa():
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 100.0}],
+    }
+    ok, msg = validate(open_order(symbol="QQQ", amount=10.0), state, EQUITY_OK)
+    assert ok, msg
+
+
+def test_permite_open_simbolo_con_posicion_valueusd_cero_o_negativa():
+    # valueUsd<=0 no cuenta como "exposición" a los fines de no-duplicación
+    # (spec: "valueUsd>0") — una posición residual en cero o negativa no
+    # bloquea reabrir el símbolo.
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": 0.0}],
+    }
+    ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
+    assert ok, msg
+
+
+# --- WP1: tope de exposición agregada (MAX_TOTAL_EXPOSURE_PCT = 70%) -------
+#
+# Sin este tope, 3 símbolos distintos al 25% cada uno (75% del portfolio)
+# eran legales bajo el único tope por símbolo. positions con 70% existente
+# repartido en varios símbolos (ninguno individualmente sobre 25%) más una
+# apertura nueva.
+
+_STATE_69PCT = {
+    "cashUsd": 3200.0,
+    "positions": [
+        {"symbol": "XLE", "valueUsd": 2000.0},
+        {"symbol": "XLI", "valueUsd": 2000.0},
+        {"symbol": "XLP", "valueUsd": 2000.0},
+        {"symbol": "XLU", "valueUsd": 800.0},
+    ],
+}  # total = 10000, exposición existente = 6800
+
+_STATE_71PCT = {
+    "cashUsd": 3000.0,
+    "positions": [
+        {"symbol": "XLE", "valueUsd": 2000.0},
+        {"symbol": "XLI", "valueUsd": 2000.0},
+        {"symbol": "XLP", "valueUsd": 2000.0},
+        {"symbol": "XLU", "valueUsd": 1000.0},
+    ],
+}  # total = 10000, exposición existente = 7000
+
+
+def test_tope_exposicion_total_71pct_bloquea():
+    # (7000 existente + 100 nuevo) / 10000 = 71% > 70% -> bloquear.
+    # QQQ es símbolo nuevo (sin no-duplicación) y 100/10000=1% no toca el
+    # tope de 25% por posición.
+    ok, msg = validate(open_order(symbol="QQQ", amount=100.0), _STATE_71PCT, EQUITY_OK)
+    assert not ok
+    assert "70%" in msg
+
+
+def test_tope_exposicion_total_69pct_pasa():
+    # (6800 existente + 100 nuevo) / 10000 = 69% <= 70% -> pasa.
+    ok, msg = validate(open_order(symbol="QQQ", amount=100.0), _STATE_69PCT, EQUITY_OK)
+    assert ok, msg
+
+
+def test_tope_exposicion_total_mensaje_deriva_de_la_constante():
+    ok, msg = validate(open_order(symbol="QQQ", amount=100.0), _STATE_71PCT, EQUITY_OK)
+    assert not ok
+    assert f"{MAX_TOTAL_EXPOSURE_PCT:.0%}" in msg
+
+
+def test_max_total_exposure_pct_vale_70pct():
+    assert MAX_TOTAL_EXPOSURE_PCT == 0.70

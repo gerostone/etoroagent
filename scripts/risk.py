@@ -2,7 +2,18 @@
 
 Límites (spec §6, perfil Moderado) — NO negociables por el agente:
   máx 25% por posición, máx 35% cripto total, stop-loss obligatorio <= 12%,
-  drawdown >= 25% desde el máximo histórico => modo defensivo (solo cierres).
+  drawdown >= 25% desde el máximo histórico => modo defensivo (solo cierres),
+  no-duplicación (no recomprar un símbolo con exposición existente),
+  máx 70% de exposición agregada del portfolio (MAX_TOTAL_EXPOSURE_PCT).
+
+  WP1 (auditoría pre-producción, hallazgo: corridas sucesivas recompraban
+  símbolos ya tenidos — 3 corridas idénticas construían 59% de exposición
+  real donde el agente creía 37%, porque el único freno, 25% por símbolo,
+  frena tarde): la no-duplicación bloquea cualquier open sobre un símbolo
+  con exposición existente (real o pending/local) SIN excepciones, antes
+  del tope de 25% (que queda como defensa en profundidad). El tope de 70%
+  agregado cierra el hueco de que N símbolos distintos, cada uno bajo el
+  25%, sumaran una concentración total no acotada.
 
 validate() es fail-closed: ante action="open" con state o equity_rows
 incompletos, malformados o con valores no numéricos/no finitos, bloquea la
@@ -23,6 +34,11 @@ MAX_POSITION_PCT = 0.25
 MAX_CRYPTO_PCT = 0.35
 MAX_STOP_LOSS_PCT = 0.12
 DEFENSIVE_DRAWDOWN_PCT = 0.25
+# WP1 (auditoría pre-producción): tope de exposición AGREGADA del
+# portfolio (suma de TODAS las posiciones, cualquier símbolo). Sin este
+# tope, N símbolos distintos al 25% cada uno podían sumar una
+# concentración total no acotada (75% en 3 símbolos era legal).
+MAX_TOTAL_EXPOSURE_PCT = 0.70
 
 # eToro puede devolver el símbolo de un instrumento cripto en distintos
 # formatos según el endpoint/instrumento (p.ej. "BTCUSD" en vez de "BTC" —
@@ -201,6 +217,20 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
     if total <= 0:
         return False, "Valor de portfolio desconocido o cero: no se puede dimensionar."
 
+    # --- No-duplicación (WP1): CUALQUIER exposición existente en este
+    # símbolo (real o pending/local, valueUsd>0) bloquea el open, sin
+    # excepciones. Va ANTES del tope de 25% (que queda como defensa en
+    # profundidad) — mantener = no recomprar; rebalancear = cerrar en
+    # esta corrida y reevaluar en la siguiente, nunca sumar encima.
+    if any(
+        p["symbol"] == symbol and p["valueUsd"] > 0 for p in normalized_positions
+    ):
+        return False, (
+            "el símbolo ya tiene exposición: recompra/adición no permitida "
+            "(regla de no-duplicación; mantener = no recomprar, rebalancear = "
+            "cerrar y esperar la próxima corrida)"
+        )
+
     current = sum(
         p["valueUsd"] for p in normalized_positions if p["symbol"] == symbol
     )
@@ -208,6 +238,17 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
         return False, (
             f"Posición resultante en {symbol} superaría el {MAX_POSITION_PCT:.0%} del portfolio "
             f"({current + order.amount_usd:.2f} de {total:.2f} USD)."
+        )
+
+    # --- Tope de exposición agregada (WP1): suma de TODAS las posiciones
+    # (cualquier símbolo) + la orden nueva, contra MAX_TOTAL_EXPOSURE_PCT.
+    # Defensa contra concentración repartida en varios símbolos, cada uno
+    # individualmente bajo el 25%.
+    total_exposure = sum(p["valueUsd"] for p in normalized_positions) + order.amount_usd
+    if total_exposure / total > MAX_TOTAL_EXPOSURE_PCT:
+        return False, (
+            f"Exposición total resultante superaría el {MAX_TOTAL_EXPOSURE_PCT:.0%} del portfolio "
+            f"({total_exposure:.2f} de {total:.2f} USD)."
         )
 
     if symbol in CRYPTO_SYMBOLS:

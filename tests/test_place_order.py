@@ -110,10 +110,12 @@ def test_dry_run_no_llama_cliente(tmp_path, monkeypatch, dry_run_value):
         monkeypatch.setenv("DRY_RUN", dry_run_value)
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: STATE_BASIC ya tiene una posición QQQ, y WP1 bloquearía
+    # esa recompra por no-duplicación antes de llegar a DRY_RUN).
     rc = place_order.main(
         [
             "open",
-            "--symbol", "QQQ",
+            "--symbol", "SPY",
             "--amount", "20",
             "--stop-loss-pct", "0.10",
         ],
@@ -126,7 +128,7 @@ def test_dry_run_no_llama_cliente(tmp_path, monkeypatch, dry_run_value):
     client.open_position_by_amount.assert_not_called()
     journal = (tmp_path / "state" / "journal.md").read_text()
     assert "DRY_RUN" in journal
-    assert "QQQ" in journal
+    assert "SPY" in journal
 
 
 # -- 3: open real -----------------------------------------------------------
@@ -136,15 +138,16 @@ def test_open_real_abre_posicion_con_stop_loss_por_precio(tmp_path, monkeypatch)
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(100.0)
     client.open_position_by_amount.return_value = {"positionID": 55}
     rc = place_order.main(
         [
             "open",
-            "--symbol", "QQQ",
+            "--symbol", "SPY",
             "--amount", "20",
             "--stop-loss-pct", "0.10",
             "--reason", "test",
@@ -168,11 +171,12 @@ def test_open_real_no_reconoce_key_instruments_solo_items(tmp_path, monkeypatch)
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "instruments": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ"}]
+        "instruments": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY"}]
     }
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -242,13 +246,14 @@ def test_open_real_unknown_outcome_no_reintenta_y_marca_ambiguo(tmp_path, monkey
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(100.0)
     client.open_position_by_amount.side_effect = EtoroUnknownOutcomeError("body raro")
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -280,15 +285,27 @@ def test_open_simbolo_fuera_de_universo_bloquea(tmp_path, monkeypatch):
 
 
 def test_open_amount_mayor_a_cash_bloquea(tmp_path, monkeypatch):
-    """Aísla el guard de cash de la regla del 25% de risk.validate: el total
-    del portfolio es grande (1000) y la orden (100) queda holgadamente DENTRO
-    del 25% (10%), pero el cash disponible (50) no alcanza para cubrirla. Si
-    este escenario también fuera bloqueado por risk.validate (p.ej. por
-    exceder el 25%), el test pasaría igual con el guard de cash comentado —
-    lo cual NO probaría que el guard funciona. Las posiciones existentes
-    (SPY 250 + XLK 250 + XLE 250 + XLF 200 = 950) están todas <=25% del total
-    y cubren distintos símbolos del universo para no interferir con el
-    símbolo de la orden (QQQ, sin posición previa)."""
+    """Guard de cash (regla 6 del módulo): amount > cashUsd bloquea aunque
+    risk.validate() por sí solo no lo haría.
+
+    NOTA WP1: con el tope de exposición agregada (MAX_TOTAL_EXPOSURE_PCT =
+    70%) ya no es posible aislar el guard de cash en un escenario donde
+    risk.validate() pase Y falte cash real, como hacía este test antes de
+    WP1. Es una consecuencia matemática, no un descuido: total =
+    cashUsd + Σposiciones por definición de portfolio_value(); si el tope
+    agregado pasa, Σposiciones + amount <= 0.70*total, luego
+    cashUsd = total - Σposiciones >= 0.30*total + amount > amount siempre
+    que total > 0. O sea, cashUsd > amount queda GARANTIZADO por el tope
+    agregado en cualquier estado que pase risk.validate() con un símbolo
+    nuevo (<=25% de total). El guard de cash sigue en el código como
+    defensa en profundidad (regla 6, no se toca acá), pero en la práctica
+    post-WP1 el tope agregado lo cubre antes de llegar a la orden.
+
+    Este test verifica que ese mismo escenario del mundo real (cash
+    insuficiente pese a que cada posición individual está bajo el 25%)
+    sigue bloqueado — ahora por el tope agregado del 70%, en vez de por el
+    guard de cash — preservando la garantía de negocio (nunca se abre una
+    orden sin cash real) aunque el mecanismo concreto de bloqueo cambió."""
     monkeypatch.setenv("DRY_RUN", "0")
     state = {
         "updatedAt": _fresh_updated_at(),
@@ -305,9 +322,9 @@ def test_open_amount_mayor_a_cash_bloquea(tmp_path, monkeypatch):
     write_state(tmp_path, state, [("2026-08-01", 1000.0)])
     client = MagicMock()
     rc = place_order.main(
-        # QQQ sin posición previa: (0+100)/1000 = 10% <= 25% -> risk.validate
-        # NO bloquea esto por sí solo. cash disponible = 50 < 100 -> el guard
-        # de cash es el único que puede bloquear este escenario.
+        # QQQ sin posición previa: (0+100)/1000 = 10% <= 25% individual, pero
+        # exposición agregada (950+100)/1000 = 105% > 70% -> bloqueado por
+        # WP1 antes de llegar al guard de cash.
         ["open", "--symbol", "QQQ", "--amount", "100", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
@@ -317,7 +334,7 @@ def test_open_amount_mayor_a_cash_bloquea(tmp_path, monkeypatch):
     client.open_position_by_amount.assert_not_called()
     journal = (tmp_path / "state" / "journal.md").read_text()
     assert "BLOQUEADA" in journal
-    assert "cash" in journal.lower()
+    assert "70%" in journal
 
 
 # -- 9: close con position-id inexistente ------------------------------------
@@ -523,12 +540,13 @@ def test_open_precio_de_vela_invalido_bloquea_sin_abrir(tmp_path, monkeypatch, b
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = candles_resp(bad_close)
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -545,13 +563,14 @@ def test_open_vela_de_10_dias_bloquea_por_desactualizada(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     stale_from_date = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
     client.get_candles.return_value = candles_resp(100.0, from_date=stale_from_date)
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -565,12 +584,13 @@ def test_open_vela_sin_fromdate_bloquea(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
-        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "QQQ", "isHiddenFromClient": False}]
+        "items": [{"internalInstrumentId": 42, "internalSymbolFull": "SPY", "isHiddenFromClient": False}]
     }
     client.get_candles.return_value = {"candles": [{"candles": [{"close": 100.0}]}]}
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -606,8 +626,9 @@ def test_open_make_client_crashea_journalea_error_y_rc1(tmp_path, monkeypatch):
     def make_client_que_crashea():
         raise ValueError("faltan credenciales ETORO_API_KEY/ETORO_USER_KEY")
 
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=make_client_que_crashea,
     )
@@ -641,14 +662,15 @@ def test_open_multiples_matches_exactos_en_search_bloquea(tmp_path, monkeypatch)
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
+    # SPY (no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación).
     client.search_instrument.return_value = {
         "items": [
-            {"internalInstrumentId": 42, "internalSymbolFull": "QQQ"},
-            {"internalInstrumentId": 99, "internalSymbolFull": "QQQ"},
+            {"internalInstrumentId": 42, "internalSymbolFull": "SPY"},
+            {"internalInstrumentId": 99, "internalSymbolFull": "SPY"},
         ]
     }
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
@@ -735,19 +757,20 @@ def test_open_btc_sin_match_exacto_resuelve_via_variante_btcusd(tmp_path, monkey
 
 
 def test_open_equity_sin_match_no_prueba_variantes_sin_cambios(tmp_path, monkeypatch):
-    # QQQ no tiene entrada en CRYPTO_SEARCH_VARIANTS -> comportamiento
+    # SPY no tiene entrada en CRYPTO_SEARCH_VARIANTS -> comportamiento
     # identico al de antes de este fix: una sola llamada, error inmediato.
+    # (SPY, no QQQ: ya tiene posición en STATE_BASIC, WP1 bloquearía por no-duplicación.)
     monkeypatch.setenv("DRY_RUN", "0")
     write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
     client = MagicMock()
     client.search_instrument.return_value = {"items": []}
     rc = place_order.main(
-        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
         state_dir=tmp_path / "state",
         make_client=lambda: client,
     )
     assert rc == 1
-    client.search_instrument.assert_called_once_with("QQQ")
+    client.search_instrument.assert_called_once_with("SPY")
     client.open_position_by_amount.assert_not_called()
 
 

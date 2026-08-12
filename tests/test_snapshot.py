@@ -229,7 +229,10 @@ def test_ordenes_pendientes_visibles_para_risk_bloquean_exposicion_excesiva():
     equity_rows = [("2026-08-01", 9500.0), ("2026-08-02", 10000.0)]
     ok, msg = validate(order, state, equity_rows)
     assert not ok
-    assert "25%" in msg
+    # WP1: la regla de no-duplicación ahora bloquea esto ANTES de llegar al
+    # tope de 25% (la exposición pendiente de BTC ya cuenta como "el símbolo
+    # ya tiene exposición") — el 25% queda como defensa en profundidad.
+    assert "no-duplicaci" in msg.lower()
 
 
 # -- build_state: universo cerrado de símbolos (2da ronda, fix #2) ----------
