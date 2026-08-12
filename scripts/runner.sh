@@ -6,6 +6,15 @@ MODE="${1:?uso: runner.sh equities|crypto}"
 case "$MODE" in equities|crypto) ;; *) echo "modo inválido: $MODE" >&2; exit 64 ;; esac
 
 mkdir -p state reports
+
+# WP2: helper para journalear entradas que nunca llegan a place_order.py
+# (skips del runner: lock ocupado, mercado cerrado). Mismo formato de
+# timestamp que journal() en scripts/place_order.py (hora local, offset
+# explícito), para quedar legible junto al resto del journal.
+journal_line() {
+  printf -- "- %s %s\n" "$(date +"%Y-%m-%d %H:%M %z")" "$1" >> state/journal.md
+}
+
 LOCK="state/.runner.lock"
 PIDFILE="$LOCK/pid"
 GOT_LOCK=0
@@ -16,7 +25,9 @@ else
   # el directorio de lock ya existe: decidir por liveness del PID, no por edad
   OLD_PID="$(cat "$PIDFILE" 2>/dev/null || true)"
   if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "corrida en curso, salgo"; exit 0
+    echo "corrida en curso, salgo"
+    journal_line "SKIP | corrida $MODE no corrió | lock ocupado (pid $OLD_PID vivo)"
+    exit 0
   else
     echo "lock huérfano (proceso $OLD_PID no vive), limpiando"
     rm -f "$PIDFILE"
@@ -24,7 +35,9 @@ else
     if mkdir "$LOCK" 2>/dev/null; then
       GOT_LOCK=1
     else
-      echo "corrida en curso, salgo"; exit 0
+      echo "corrida en curso, salgo"
+      journal_line "SKIP | corrida $MODE no corrió | lock ocupado (perdida la carrera por el lock tras limpiar el huérfano)"
+      exit 0
     fi
   fi
 fi
@@ -55,7 +68,9 @@ if [ "$MODE" = "equities" ]; then
     1)
       case "$MO_OUT" in
         "mercado cerrado"*)
-          echo "skip: $MO_OUT"; exit 0 ;;
+          echo "skip: $MO_OUT"
+          journal_line "SKIP | corrida $MODE no corrió | $MO_OUT"
+          exit 0 ;;
         *)
           echo "ERROR: market_open.py falló (rc=1, salida inesperada): $MO_OUT" >&2; exit 1 ;;
       esac
@@ -114,5 +129,8 @@ export ETOROAGENT_RUN_ID="${STAMP}-${MODE}"
   # permitidos: dirección fail-safe, siempre se puede reducir riesgo).
   printf '{\n  "reason": "corrida %s abortada (claude exit %s)",\n  "log": "reports/%s-%s.log",\n  "at": "%s"\n}\n' \
     "$MODE" "$CLAUDE_RC" "$STAMP" "$MODE" "$(date +"%Y-%m-%d %H:%M %z")" > state/.needs_reconciliation
+  # Notificación best-effort al operador: si osascript no está disponible o
+  # falla (headless sin sesión gráfica, no-mac), no debe romper el runner.
+  osascript -e "display notification \"corrida ${MODE} abortada — ver journal\" with title \"etoro-agent\"" || true
 }
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"
