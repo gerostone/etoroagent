@@ -39,6 +39,21 @@ Con `--full` imprime el JSON crudo de siempre:
 Fail-closed: cualquier error (símbolo no encontrado, ambiguo, formato de
 velas inesperado, error HTTP, etc.) escribe a stderr y termina con exit 1,
 sin imprimir nada a stdout.
+
+Validación de cantidad de velas (WP3 auditoría, ver
+docs/verificacion-mom126.md): si la API devuelve menos velas de las
+pedidas, se imprime un WARNING a stderr con ambas cantidades y, en el modo
+default, el header del CSV agrega `requested=<N>` para dejar constancia.
+Si además ese faltante deja menos de MIN_CANDLES_FOR_SIGNALS (130) velas
+disponibles Y se habían pedido --count >= 130 (el caso real siempre pide
+210 — ver PLAYBOOK.md §Señales, mom126 necesita el índice -127), la
+corrida falla cerrado (exit 1, sin stdout): sin datos suficientes no hay
+señal confiable. Pedidos deliberadamente chicos (--count < 130, p.ej. para
+inspeccionar unas pocas velas con --full) no disparan ese piso — ahí el
+llamador ya sabe que no está pidiendo datos para señales.
+
+`--count` fuera de [1, 1000] o no entero es un error de uso, no de datos:
+exit code 2 (vía argparse), no el exit 1 de fail-closed.
 """
 import argparse
 import json
@@ -52,6 +67,34 @@ from etoro_api import (  # noqa: E402
     extract_exact_match,
 )
 from risk import CRYPTO_SEARCH_VARIANTS  # noqa: E402
+
+
+# Piso de velas para que mom126 (PLAYBOOK.md §Señales) sea confiable: la
+# fórmula usa el índice -127 (127 velas atrás), así que hacen falta al
+# menos 130 velas de margen. Solo aplica cuando --count pedido ya apuntaba
+# a ese piso (>=130, el caso real: PLAYBOOK.md siempre pide --count 210) —
+# pedidos deliberadamente chicos no lo disparan (ver docstring del módulo,
+# y docs/verificacion-mom126.md para el detalle de la investigación WP3).
+MIN_CANDLES_FOR_SIGNALS = 130
+
+
+def _count_type(value: str) -> int:
+    """Validador de --count para argparse: entero en [1, 1000]. Cualquier
+    otro valor es un error de USO (símbolo/flags mal pasados), no un
+    fail-closed de datos -> argparse lo convierte en exit code 2
+    (ArgumentTypeError), distinto del exit 1 de fail-closed por datos
+    insuficientes/formato inesperado."""
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--count debe ser un entero, se recibio: {value!r}"
+        )
+    if not (1 <= count <= 1000):
+        raise argparse.ArgumentTypeError(
+            f"--count debe estar entre 1 y 1000, se recibio: {count}"
+        )
+    return count
 
 
 def make_client() -> EtoroClient:
@@ -110,19 +153,34 @@ def _extract_candle_list(candles_resp) -> list:
         raise ValueError(f"formato de velas inesperado: {exc}") from exc
 
 
-def _closes_ascending_csv(symbol: str, interval: str, candles_resp) -> str:
+def _closes_ascending_csv(
+    symbol: str, interval: str, candle_list: list, requested_count: int
+) -> str:
     """Formato default (ver docstring del módulo): header de metadata en
     comentario + una línea "fromDate,close" por vela, en orden ASCENDENTE.
 
-    La API entrega en direction=desc (nuevo->viejo — default de
+    `candle_list` ya viene extraído por el caller (ver _extract_candle_list
+    en main()) en direction=desc (nuevo->viejo — default de
     EtoroClient.get_candles, que este script no sobreescribe), así que acá
     se invierte la lista antes de imprimir. El orden ascendente es el que
     necesitan los cálculos de PLAYBOOK.md (momentum N-velas-atrás, SMA):
     con la lista ascendente, el índice -1 es "hoy" y el índice -(N+1) es
-    "hace N velas"."""
-    candle_list = _extract_candle_list(candles_resp)
+    "hace N velas".
+
+    Si `len(candle_list) < requested_count` (la API devolvió menos velas
+    de las pedidas — main() ya emitió el WARNING a stderr), el header deja
+    constancia agregando `requested=<requested_count>` (WP3 auditoría, ver
+    docs/verificacion-mom126.md)."""
     ascending = list(reversed(candle_list))
-    lines = [f"# symbol={symbol} interval={interval} count={len(ascending)} order=asc"]
+    actual_count = len(ascending)
+    if actual_count < requested_count:
+        header = (
+            f"# symbol={symbol} interval={interval} count={actual_count} "
+            f"requested={requested_count} order=asc"
+        )
+    else:
+        header = f"# symbol={symbol} interval={interval} count={actual_count} order=asc"
+    lines = [header]
     for candle in ascending:
         lines.append(f"{candle.get('fromDate')},{candle.get('close')}")
     return "\n".join(lines)
@@ -131,7 +189,7 @@ def _closes_ascending_csv(symbol: str, interval: str, candles_resp) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="candles.py")
     parser.add_argument("--symbol", required=True)
-    parser.add_argument("--count", required=True, type=int)
+    parser.add_argument("--count", required=True, type=_count_type)
     parser.add_argument("--interval", default="OneDay")
     parser.add_argument(
         "--full",
@@ -153,6 +211,19 @@ def main(argv=None, make_client=make_client) -> int:
         candles_resp = client.get_candles(
             instrument_id, interval=args.interval, count=args.count
         )
+        candle_list = _extract_candle_list(candles_resp)
+        actual_count = len(candle_list)
+        if actual_count < args.count:
+            print(
+                f"ADVERTENCIA: se pidieron {args.count} velas, la API devolvio {actual_count}",
+                file=sys.stderr,
+            )
+        if args.count >= MIN_CANDLES_FOR_SIGNALS and actual_count < MIN_CANDLES_FOR_SIGNALS:
+            raise ValueError(
+                "datos insuficientes para señales (mom126 usa el indice -127, "
+                f"piso de {MIN_CANDLES_FOR_SIGNALS} velas): se pidieron "
+                f"{args.count}, la API devolvio apenas {actual_count}"
+            )
         if args.full:
             print(
                 json.dumps(
@@ -160,7 +231,7 @@ def main(argv=None, make_client=make_client) -> int:
                 )
             )
         else:
-            print(_closes_ascending_csv(symbol, args.interval, candles_resp))
+            print(_closes_ascending_csv(symbol, args.interval, candle_list, args.count))
         return 0
     except Exception as exc:
         print(f"ERROR en candles: {exc}", file=sys.stderr)
