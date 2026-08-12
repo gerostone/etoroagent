@@ -79,6 +79,35 @@ persistido en `state/` al inicio de cada sesión.
   propio fallback a neutral sin abortar la corrida — ver §Señales, régimen
   de volatilidad, para el detalle y el alcance exacto de esa excepción.
 
+## Reconciliación tras corrida abortada
+
+Si existe `state/.needs_reconciliation` (lo crea `scripts/runner.sh` cuando
+`claude` termina con código != 0 — ver la entrada `ABORTADA` correspondiente
+en `state/journal.md` y el log referenciado ahí), tu **PRIMERA tarea tras el
+snapshot** es reconciliar, antes de cualquier otro análisis:
+
+1. Comparás las posiciones del snapshot recién tomado contra las entradas
+   `DRY_RUN`/`ABIERTA`/`DECISION` del journal reciente (las últimas
+   corridas, especialmente la abortada y la inmediatamente anterior).
+2. Toda posición del snapshot sin una decisión correspondiente en el
+   journal, o toda decisión de apertura en el journal sin la posición
+   correspondiente en el snapshot, se journalea como **hallazgo** con tu
+   mejor reconstrucción de por qué (el log referenciado en el flag —
+   `reports/<stamp>-<modo>.log` — ayuda: ahí puede estar el razonamiento
+   que no llegó a `state/journal.md`).
+3. Journaleás una entrada `RECONCILIACION` con el resultado, aunque sea "sin
+   discrepancias" — la ausencia de hallazgos también es información de
+   auditoría.
+4. Recién entonces eliminás `state/.needs_reconciliation` y continuás la
+   corrida con normalidad.
+
+Mientras el archivo exista, `scripts/place_order.py` bloquea toda apertura
+(`exit 2`) — los cierres siguen permitidos, es la dirección fail-safe. Si el
+paso 2 encuentra discrepancias que no podés explicar con confianza: **NO
+abras posiciones en esta corrida** (los cierres por señal de salida siguen
+permitidos igual). No borres el flag hasta haber journaleado la
+`RECONCILIACION`.
+
 ## Universo operable
 
 Universo cerrado: exactamente los símbolos definidos en `UNIVERSE` de
