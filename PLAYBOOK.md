@@ -189,6 +189,16 @@ ya valida `scripts/risk.py` — el juicio del agente solo resta riesgo, nunca
 lo suma. Toda decisión (aceptar, reducir, rechazar) se journalea con su
 razonamiento antes de, o en lugar de, llamar a `place_order.py`.
 
+## Nota de auto-observación (evitar falsa alarma recurrente)
+
+El archivo `reports/<stamp>-<modo>.log` de TU PROPIA corrida en curso siempre
+se ve VACÍO mientras corrés: el runner bufferiza tu salida y la escribe recién
+cuando terminás. NUNCA interpretes el .log más reciente (el que coincide con tu
+ventana de ejecución actual) como evidencia de una corrida abortada. La
+detección de corridas abortadas NO es tu tarea: el runner las journalea como
+ABORTADA en state/journal.md automáticamente. Para saber si una corrida
+anterior falló, consultá el journal, no los .log.
+
 ## Cierre de corrida
 
 Al terminar (haya operado o no), el agente escribe:
