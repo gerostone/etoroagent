@@ -742,6 +742,79 @@ def _escribe_sobre_estado_protegido(segmento: str) -> bool:
     return False
 
 
+_ENV_SPOOF_ASSIGN_RE = re.compile(
+    r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR)\s*="
+)
+_ENV_SPOOF_SCRIPT_RE = re.compile(
+    r"scripts/(?:place_order|snapshot|candles|reconcile)\.py\b"
+)
+
+
+# -- Interpretes alternativos que evaden los operadores de shell vigilados -
+# -- (WP5/N8) -------------------------------------------------------------
+#
+# _escribe_sobre_estado_protegido (arriba) detecta OPERADORES DE SHELL de
+# escritura/borrado (tee/mv/rm/etc) seguidos del path protegido. Pero un
+# interprete (python3 -c, perl -e, ruby -e) que invoca una funcion de
+# borrado DENTRO del lenguaje (os.remove(...), unlink(...), File.delete),
+# o `find ... -delete`, no usa NINGUNO de esos operadores de shell -- el
+# borrado ocurre adentro del interprete, invisible a esa deteccion por
+# operador+region. Vectores reales que esto cierra: `python3 -c
+# "import os; os.remove('state/.run_orders.json')"`, `perl -e
+# "unlink('state/.needs_reconciliation')"`, `find state -name
+# .needs_reconciliation -delete`, y variantes que reconstruyen el mismo
+# ataque via xargs/eval.
+#
+# Regla, deliberadamente mas amplia y menos precisa que la de operador+
+# region: un segmento que MENCIONE uno de los dos archivos de control
+# (".run_orders" o ".needs_reconciliation", substring -- sin exigir el
+# prefijo "state/", para cubrir tambien `find state -name
+# .needs_reconciliation -delete`, donde el path no aparece contiguo) Y
+# ademas contenga un VEHICULO de ejecucion o borrado (python/perl/ruby/
+# sh -c/bash -c/find/xargs/eval/rm/unlink/shred/dd) se bloquea -- salvo
+# que el segmento sea una invocacion real de uno de los 4 scripts
+# autorizados (place_order.py/snapshot.py/candles.py/reconcile.py), que
+# legitimamente pueden mencionar estos archivos en su propio texto (p.ej.
+# un --reason que los cite) sin que eso sea un intento de evadirlos.
+# Lecturas puras (cat/ls/grep/head/tail, sin ninguno de esos vehiculos)
+# siguen permitidas -- no llevan ningun token de la lista.
+#
+# Mismo criterio de heredoc-body y backtick-operador que
+# _escribe_sobre_estado_protegido (ver _enmascarar_cuerpos_de_heredoc y
+# _BACKTICK_SPAN_RE): un heredoc que journalea/documenta estos nombres
+# como DATO, o una mencion en prosa envuelta entre backticks, no cuenta
+# como invocacion real.
+_ARCHIVO_PROTEGIDO_MENCION_RE = re.compile(
+    r"\.run_orders|\.needs_reconciliation"
+)
+_VEHICULO_EJECUCION_O_BORRADO_RE = re.compile(
+    r"\b(python3?|perl|ruby|find|xargs|eval|rm|unlink|shred|dd)\b"
+    r"|\b(?:sh|bash)\s+-c\b"
+)
+
+
+def _script_autorizado_presente(segmento: str) -> bool:
+    for variante in (segmento, _normalizar(segmento), _normalizar_sin_concat(segmento)):
+        if _ENV_SPOOF_SCRIPT_RE.search(variante):
+            return True
+    return False
+
+
+def _bloqueado_interprete_alternativo(segmento: str) -> bool:
+    if _script_autorizado_presente(segmento):
+        return False
+    base = _enmascarar_cuerpos_de_heredoc(segmento)
+    for variante in (base, _normalizar(base), _normalizar_sin_concat(base)):
+        if not _ARCHIVO_PROTEGIDO_MENCION_RE.search(variante):
+            continue
+        backtick_spans = list(_BACKTICK_SPAN_RE.finditer(variante))
+        for m in _VEHICULO_EJECUCION_O_BORRADO_RE.finditer(variante):
+            if any(s.start() <= m.start() < s.end() for s in backtick_spans):
+                continue
+            return True
+    return False
+
+
 # -- Asignacion inline de env vars que evaden presupuesto/aislamiento ------
 # -- de state (WP4/N4a) ------------------------------------------------
 #
@@ -760,12 +833,6 @@ def _escribe_sobre_estado_protegido(segmento: str) -> bool:
 # distintos para el resto de este hook) sigue exportando la variable
 # para el resto del comando en un shell real -- partir por segmento
 # aca dejaria pasar exactamente la variante de evasion mas obvia.
-_ENV_SPOOF_ASSIGN_RE = re.compile(
-    r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR)\s*="
-)
-_ENV_SPOOF_SCRIPT_RE = re.compile(
-    r"scripts/(?:place_order|snapshot|candles|reconcile)\.py\b"
-)
 
 
 def _bloqueado_env_spoof(command: str) -> bool:
@@ -812,6 +879,8 @@ def _bloqueado_guardrail(command: str) -> bool:
 def _bloqueado_estado_protegido(command: str) -> bool:
     for segmento in _split_segments(command):
         if _escribe_sobre_estado_protegido(segmento):
+            return True
+        if _bloqueado_interprete_alternativo(segmento):
             return True
     return False
 

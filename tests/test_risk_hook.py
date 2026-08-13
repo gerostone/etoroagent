@@ -901,3 +901,137 @@ def test_bloquea_tee_heredoc_sobre_needs_reconciliation_target_antes_del_heredoc
     # detección del operador+destino que aparecen ANTES del marcador `<<`.
     r = run_hook("tee state/.needs_reconciliation <<'EOF'\nevil\nEOF")
     assert r.returncode == 2
+
+
+# --- WP5/N8: intérpretes alternativos que borran los guards sin pasar ------
+# --- por ningún operador de shell vigilado (tee/mv/rm/etc) -----------------
+#
+# Re-auditoría: _escribe_sobre_estado_protegido detecta operadores de SHELL
+# (tee/mv/rm/...) seguidos del path protegido -- pero `python3 -c
+# "os.remove(...)"`, `perl -e unlink(...)`, o `find ... -delete` borran el
+# archivo DENTRO del intérprete/comando, sin usar ninguno de esos
+# operadores. _bloqueado_interprete_alternativo cierra esto: cualquier
+# comando que MENCIONE uno de los dos archivos de control Y contenga un
+# vehículo de ejecución/borrado (python/perl/ruby/sh -c/bash -c/find/
+# xargs/eval/rm/unlink/shred/dd) se bloquea, salvo invocación real de un
+# script autorizado.
+
+
+def test_bloquea_python_os_remove_sobre_run_orders():
+    r = run_hook(
+        "python3 -c \"import os; os.remove('state/.run_orders.json')\""
+    )
+    assert r.returncode == 2
+    assert "risk_hook.py" in r.stderr
+
+
+def test_bloquea_python_os_remove_sobre_needs_reconciliation():
+    r = run_hook(
+        "python3 -c \"import os; os.remove('state/.needs_reconciliation')\""
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_perl_unlink_sobre_needs_reconciliation():
+    r = run_hook(
+        "perl -e \"unlink('state/.needs_reconciliation')\""
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_perl_unlink_sobre_run_orders():
+    r = run_hook("perl -e \"unlink('state/.run_orders.json')\"")
+    assert r.returncode == 2
+
+
+def test_bloquea_ruby_file_delete_sobre_needs_reconciliation():
+    r = run_hook(
+        "ruby -e \"File.delete('state/.needs_reconciliation')\""
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_find_delete_sobre_needs_reconciliation():
+    r = run_hook("find state -name .needs_reconciliation -delete")
+    assert r.returncode == 2
+
+
+def test_bloquea_find_delete_sobre_run_orders():
+    r = run_hook("find state -name .run_orders.json -delete")
+    assert r.returncode == 2
+
+
+def test_bloquea_xargs_rm_sobre_needs_reconciliation():
+    r = run_hook("echo state/.needs_reconciliation | xargs rm")
+    assert r.returncode == 2
+
+
+def test_bloquea_eval_reconstruido_sobre_needs_reconciliation():
+    r = run_hook('eval "rm state/.needs_reconciliation"')
+    assert r.returncode == 2
+
+
+def test_bloquea_sh_dash_c_sobre_run_orders():
+    r = run_hook("sh -c \"rm state/.run_orders.json\"")
+    assert r.returncode == 2
+
+
+def test_bloquea_shred_sobre_needs_reconciliation():
+    r = run_hook("shred -u state/.needs_reconciliation")
+    assert r.returncode == 2
+
+
+def test_bloquea_dd_sobre_run_orders():
+    r = run_hook("dd if=/dev/null of=state/.run_orders.json")
+    assert r.returncode == 2
+
+
+# -- Permitidos: lecturas puras y scripts autorizados -----------------------
+
+
+def test_permite_cat_needs_reconciliation_n8():
+    r = run_hook("cat state/.needs_reconciliation")
+    assert r.returncode == 0
+
+
+def test_permite_ls_state_n8():
+    r = run_hook("ls -la state/")
+    assert r.returncode == 0
+
+
+def test_permite_grep_run_orders_n8():
+    r = run_hook("grep count state/.run_orders.json")
+    assert r.returncode == 0
+
+
+def test_permite_head_needs_reconciliation_n8():
+    r = run_hook("head state/.needs_reconciliation")
+    assert r.returncode == 0
+
+
+def test_permite_tail_run_orders_n8():
+    r = run_hook("tail state/.run_orders.json")
+    assert r.returncode == 0
+
+
+def test_permite_reconcile_done_pese_a_mencionar_needs_reconciliation():
+    r = run_hook(".venv/bin/python scripts/reconcile.py --done")
+    assert r.returncode == 0
+
+
+def test_permite_place_order_con_reason_que_menciona_run_orders():
+    # Invocación real de un script autorizado que menciona el archivo
+    # protegido en su propio texto (--reason) -- no es un intento de
+    # evadirlo, place_order.py maneja ese archivo internamente.
+    r = run_hook(
+        '.venv/bin/python scripts/place_order.py open --symbol SPY --amount 10 '
+        '--stop-loss-pct 0.1 --reason "verificado tras chequear state/.run_orders.json"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_snapshot_con_reason_que_menciona_needs_reconciliation():
+    r = run_hook(
+        '.venv/bin/python scripts/snapshot.py'
+    )
+    assert r.returncode == 0
