@@ -769,14 +769,34 @@ def test_permite_lectura_grep_run_orders_json():
 
 
 def test_permite_journal_normal_no_bloquea_por_mencion_de_estado_protegido():
-    # Journalear (tee -a a journal.md) mencionando estos archivos como TEXTO
-    # (no como destino) sigue permitido -- el destino real es journal.md.
+    # Journalear (tee -a a journal.md) SIN mencionar ninguno de los cuatro
+    # archivos protegidos (PROTECTED_STATE_FILES) sigue permitido -- el
+    # destino real es journal.md, que no está en la lista. Ver
+    # test_bloquea_journal_que_menciona_archivo_protegido_wp6 para el caso
+    # (post-WP6) en el que el journaling SÍ nombra un archivo protegido.
+    r = run_hook(
+        "tee -a state/journal.md <<'EOF'\n"
+        "- 2026-08-12 20:20 -0300 RECONCILIACION | sin discrepancias\n"
+        "EOF"
+    )
+    assert r.returncode == 0
+
+
+def test_bloquea_journal_que_menciona_archivo_protegido_wp6():
+    # WP6/N11: a diferencia de WP4/N3c y WP5/N8 (que enmascaraban el CUERPO
+    # de un heredoc para no confundir DATO con comando), el default-deny
+    # por mención NO tiene esa excepción -- un journaling que nombre
+    # literalmente uno de los cuatro archivos protegidos también se
+    # bloquea, aunque el destino real sea journal.md. Costo aceptado a
+    # propósito (ver docstring de PROTECTED_STATE_FILES en risk_hook.py):
+    # journalear una entrada debe referirse a estos archivos de forma
+    # descriptiva ("el flag de reconciliación") en vez de nombrarlos.
     r = run_hook(
         "tee -a state/journal.md <<'EOF'\n"
         "- 2026-08-12 20:20 -0300 RECONCILIACION | sin discrepancias vs state/.needs_reconciliation\n"
         "EOF"
     )
-    assert r.returncode == 0
+    assert r.returncode == 2
 
 
 # --- WP4/N4(a): asignación inline de ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR -
@@ -856,65 +876,77 @@ def test_permite_pytest_con_etoroagent_run_id_en_nombre_de_test():
     assert r.returncode == 0
 
 
-def test_permite_mencion_de_rm_entre_backticks_en_prosa_de_commit():
-    # Regresión real: encontrada al commitear este mismo cambio. Documentar
-    # la protección en un mensaje de commit inevitablemente menciona
-    # "rm state/.needs_reconciliation" como prosa -- envuelto entre
-    # backticks (convención markdown), no debe bloquear.
+def test_bloquea_mencion_de_rm_entre_backticks_en_prosa_de_commit_wp6():
+    # WP6/N11: a diferencia de la versión WP4/N3c de esta protección (que
+    # descartaba explícitamente un operador cuyo NOMBRE cayera dentro de
+    # backticks, como convención markdown de prosa/documentación), el
+    # default-deny por mención NO distingue prosa de invocación real --
+    # cualquier mención del archivo protegido bloquea, sin excepción para
+    # backticks. Este test antes esperaba rc==0 (exención de prosa); ahora
+    # documenta el comportamiento correcto tras el cambio de estrategia:
+    # incluso un mensaje de commit que solo DOCUMENTA la protección debe
+    # evitar nombrar el archivo protegido literalmente.
     r = run_hook(
         "git commit -m \"antes nada impedia \\`rm state/.needs_reconciliation\\` "
         "sin haber reconciliado nada\""
     )
-    assert r.returncode == 0
+    assert r.returncode == 2
 
 
-def test_permite_mencion_de_rm_sin_backticks_dentro_de_heredoc():
-    # Regresión real (2): un heredoc que escribe a un archivo NO protegido
-    # (p.ej. este mismo archivo de tests) puede tener, como DATO/texto
-    # literal, una línea que menciona "rm state/.needs_reconciliation" sin
-    # backticks -- el cuerpo del heredoc es DATA, no comandos nuevos.
+def test_bloquea_mencion_de_rm_sin_backticks_dentro_de_heredoc_wp6():
+    # WP6/N11: ídem el anterior, pero para el enmascarado de CUERPO de
+    # heredoc que WP4/N3c y WP5/N8 aplicaban (para no confundir un
+    # ejemplo de texto/test citado dentro de un heredoc con una invocación
+    # real). El default-deny por mención ya no distingue: el archivo de
+    # destino real de este heredoc (tests/some_file.py) no es uno de los
+    # protegidos, pero el CUERPO menciona "state/.needs_reconciliation"
+    # como dato/texto -- eso alcanza para bloquear, aunque no sea una
+    # invocación real sobre el archivo protegido.
     r = run_hook(
         "cat >> tests/some_file.py << 'EOF'\n"
         'r = run_hook("rm state/.needs_reconciliation")\n'
         "EOF"
     )
-    assert r.returncode == 0
+    assert r.returncode == 2
 
 
-def test_bloquea_rm_sin_backticks_sigue_bloqueando_tras_el_fix_de_prosa():
-    # Control positivo: el fix de prosa no debe relajar la detección real.
+def test_bloquea_rm_sobre_needs_reconciliation_sin_backticks():
+    # Control positivo: la invocación real (sin ningún backtick de por
+    # medio) sigue bloqueada, como siempre.
     r = run_hook("rm state/.needs_reconciliation")
     assert r.returncode == 2
 
 
 def test_bloquea_rm_con_argumento_citado_sin_backticks_sobre_rm():
-    # El operador "rm" en sí NO está entre backticks acá -- solo su
-    # argumento está citado (comillas normales, invocación real). Debe
-    # seguir bloqueando: el fix de prosa solo descarta el operador cuando
-    # el propio NOMBRE del comando cae dentro de backticks.
+    # Invocación real con el argumento citado (comillas normales) -- debe
+    # seguir bloqueando.
     r = run_hook('rm "state/.needs_reconciliation"')
     assert r.returncode == 2
 
 
 def test_bloquea_tee_heredoc_sobre_needs_reconciliation_target_antes_del_heredoc():
-    # Control: el enmascarado del CUERPO del heredoc no debe afectar la
-    # detección del operador+destino que aparecen ANTES del marcador `<<`.
+    # Control: el archivo protegido se menciona ANTES del marcador `<<`
+    # (como destino real de tee), no solo dentro del cuerpo -- debe
+    # bloquear igual bajo el default-deny por mención.
     r = run_hook("tee state/.needs_reconciliation <<'EOF'\nevil\nEOF")
     assert r.returncode == 2
 
 
-# --- WP5/N8: intérpretes alternativos que borran los guards sin pasar ------
-# --- por ningún operador de shell vigilado (tee/mv/rm/etc) -----------------
+# --- WP5/N8 (histórico, superado por WP6/N11 -- ver más abajo): ------------
+# --- intérpretes alternativos que borran los guards sin pasar por ----------
+# --- ningún operador de shell vigilado (tee/mv/rm/etc) ---------------------
 #
-# Re-auditoría: _escribe_sobre_estado_protegido detecta operadores de SHELL
-# (tee/mv/rm/...) seguidos del path protegido -- pero `python3 -c
-# "os.remove(...)"`, `perl -e unlink(...)`, o `find ... -delete` borran el
-# archivo DENTRO del intérprete/comando, sin usar ninguno de esos
-# operadores. _bloqueado_interprete_alternativo cierra esto: cualquier
-# comando que MENCIONE uno de los dos archivos de control Y contenga un
-# vehículo de ejecución/borrado (python/perl/ruby/sh -c/bash -c/find/
-# xargs/eval/rm/unlink/shred/dd) se bloquea, salvo invocación real de un
-# script autorizado.
+# Re-auditoría original (N8): la detección por operador+región (tee/mv/
+# rm/... seguidos del path protegido) no veía `python3 -c
+# "os.remove(...)"`, `perl -e unlink(...)`, o `find ... -delete`, que
+# borran el archivo DENTRO del intérprete/comando. N8 lo cerró enumerando
+# vehículos de ejecución/borrado conocidos -- pero esa lista NUNCA
+# convergió (siguiente ronda: `node -e`). WP6/N11 (ver la sección de más
+# abajo) reemplazó por completo ese mecanismo con default-deny por
+# mención: los tests de ESTA sección siguen pasando porque el nuevo
+# mecanismo bloquea un superconjunto de lo que bloqueaba N8 -- se dejan
+# acá como regresión histórica, no porque el código todavía use listas de
+# vehículos.
 
 
 def test_bloquea_python_os_remove_sobre_run_orders():
@@ -1030,8 +1062,142 @@ def test_permite_place_order_con_reason_que_menciona_run_orders():
     assert r.returncode == 0
 
 
-def test_permite_snapshot_con_reason_que_menciona_needs_reconciliation():
+def test_permite_snapshot_script_n8():
     r = run_hook(
         '.venv/bin/python scripts/snapshot.py'
     )
     assert r.returncode == 0
+
+
+# --- WP6/N11: default-deny por mención (reemplaza la lista negra de -------
+# --- vehículos de N8) -------------------------------------------------
+#
+# Re-auditoría: la lista de vehículos de N8 (python/perl/ruby/find/xargs/
+# eval/rm/unlink/shred/dd/sh -c/bash -c) NUNCA converge -- cada ronda
+# encontró un vehículo nuevo no enumerado (rm -> python -c -> node -e/
+# heredoc). PROTECTED_STATE_FILES (.run_orders, .needs_reconciliation,
+# positions.json, equity.csv -- N11 agrega los dos últimos, INPUTS de los
+# seis límites duros de risk.py) ahora se protege por DEFAULT-DENY: toda
+# mención bloquea, salvo (a) invocación real de un script autorizado, o
+# (b) una lectura pura y completa (cat/head/tail/less/more/wc/ls/stat/
+# grep/diff, o `python3 -m json.tool`) sin ningún otro operador de shell.
+
+
+def test_bloquea_node_unlink_sobre_run_orders():
+    # El vector que motivó el cambio de estrategia: "node" nunca estuvo
+    # en ninguna lista de vehículos -- bajo default-deny no hace falta
+    # enumerarlo, la sola mención del archivo alcanza para bloquear.
+    r = run_hook(
+        "node -e \"require('fs').unlinkSync('state/.run_orders.json')\""
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_heredoc_python_os_remove_sobre_positions_json():
+    r = run_hook(
+        "python3 - <<EOF\n"
+        "import os\n"
+        "os.remove('state/positions.json')\n"
+        "EOF"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_echo_redireccion_sobre_equity_csv():
+    r = run_hook("echo x > state/equity.csv")
+    assert r.returncode == 2
+
+
+def test_bloquea_chflags_sobre_positions_json():
+    r = run_hook("chflags uchg state/positions.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_mv_sobre_positions_json():
+    r = run_hook("mv fake.json state/positions.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_cp_sobre_positions_json():
+    r = run_hook("cp fake.json state/positions.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_awk_inplace_sobre_equity_csv():
+    # Otro vehículo nunca antes enumerado (ni en N8 ni en ninguna lista
+    # negra) -- prueba directa de que el default-deny no depende de
+    # reconocer el nombre del intérprete/herramienta.
+    r = run_hook("awk '{print}' state/equity.csv > /tmp/x")
+    assert r.returncode == 2
+
+
+def test_permite_cat_positions_json():
+    r = run_hook("cat state/positions.json")
+    assert r.returncode == 0
+
+
+def test_permite_grep_positions_json():
+    r = run_hook("grep BTC state/positions.json")
+    assert r.returncode == 0
+
+
+def test_permite_python_json_tool_positions_json():
+    r = run_hook("python3 -m json.tool state/positions.json")
+    assert r.returncode == 0
+
+
+def test_permite_tail_equity_csv():
+    r = run_hook("tail state/equity.csv")
+    assert r.returncode == 0
+
+
+def test_bloquea_cat_positions_json_pipe_a_bash():
+    # Excepción (b) exige la invocación COMPLETA sin ningún otro operador
+    # de shell -- un pipe a un vehículo de ejecución saca al comando de
+    # la excepción de lectura pura y cae al default-deny.
+    r = run_hook("cat state/positions.json | bash")
+    assert r.returncode == 2
+
+
+def test_permite_pytest_tests_completo():
+    r = run_hook(".venv/bin/pytest tests/ -q")
+    assert r.returncode == 0
+
+
+def test_permite_printf_append_a_journal_sin_mencionar_protegidos():
+    # Crítico para el flujo real: el journaling normal del agente
+    # (printf/tee >> state/journal.md) sigue funcionando -- journal.md no
+    # está en PROTECTED_STATE_FILES y este comando no menciona ninguno de
+    # los cuatro archivos que sí lo están.
+    r = run_hook(
+        "printf -- '- 2026-08-13 10:00 -0300 DRY_RUN | open QQQ amount=50\\n' "
+        ">> state/journal.md"
+    )
+    assert r.returncode == 0
+
+
+def test_permite_tee_append_a_journal_sin_mencionar_protegidos_wp6():
+    r = run_hook("echo 'nota de journal' | tee -a state/journal.md")
+    assert r.returncode == 0
+
+
+def test_permite_grep_con_pipe_de_regex_citado_no_es_pipe_de_shell():
+    # Regresión real: encontrada al verificar este mismo cambio. Un patrón
+    # de grep con alternancia ("a\|b") trae un "|" LITERAL dentro de las
+    # comillas -- no es un pipe de shell real, y _es_lectura_segura_de_estado
+    # debe reconocerlo como tal (chequea operadores sobre el segmento con
+    # las comillas enmascaradas, no sobre el texto crudo) para no perder la
+    # excepción (b) de lectura pura.
+    r = run_hook(
+        'grep -n "needs_reconciliation\\|run_orders\\|positions.json\\|equity.csv" '
+        "PLAYBOOK.md"
+    )
+    assert r.returncode == 0
+
+
+def test_bloquea_grep_con_pipe_de_shell_real_pese_a_comillas_en_otro_lado():
+    # Control negativo: un pipe de shell REAL (fuera de comillas) sigue
+    # descalificando la excepción, aunque el comando tenga comillas en
+    # otra parte.
+    r = run_hook('grep "BTC" state/positions.json | bash')
+    assert r.returncode == 2

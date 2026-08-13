@@ -25,15 +25,26 @@ la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
       §Cierre de corrida) sigue permitido: la regla mira el DESTINO de la
       escritura, no la sola presencia de `tee`/`>>` en el comando.
 
-  (C) WP4/N3: escrituras de shell (incluido `rm`) sobre los archivos de
-      CONTROL state/.run_orders.json (presupuesto de órdenes) y
-      state/.needs_reconciliation (flag de reconciliación). A diferencia
-      del resto de state/ (positions.json, equity.csv, journal.md, que el
-      agente journalea/lee libremente), estos dos son de solo lectura por
-      Bash -- si el agente pudiera `rm state/.needs_reconciliation`, el
-      protocolo de reconciliación de PLAYBOOK.md sería honor system puro.
-      `scripts/reconcile.py --done` es la única vía autorizada para
-      borrar el flag (verifica el journal antes -- ver su docstring).
+  (C) WP4/N3, ampliado por WP5/N8 y WP6/N11: state/.run_orders.json
+      (presupuesto de órdenes), state/.needs_reconciliation (flag de
+      reconciliación), state/positions.json y state/equity.csv (los
+      INPUTS de los seis límites duros de risk.py) son archivos de
+      CONTROL. WP4/N3 bloqueaba operadores de shell (rm/tee/mv/etc)
+      seguidos del path; WP5/N8 amplió esto a intérpretes alternativos
+      (python3 -c, perl -e, find -delete) enumerando vehículos
+      conocidos -- pero esa lista NUNCA converge (cada ronda de
+      auditoría encontró un vehículo nuevo: rm -> python -c -> node -e/
+      heredoc). WP6/N11 invierte la estrategia: DEFAULT-DENY POR
+      MENCIÓN -- cualquier comando que nombre uno de estos cuatro
+      archivos se bloquea, salvo (a) invocar uno de los 4 scripts
+      autorizados, o (b) una lectura pura y completa (cat/head/tail/
+      less/more/wc/ls/stat/grep/diff, o `python3 -m json.tool`), sin
+      ningún otro operador de shell en el mismo comando -- ver
+      PROTECTED_STATE_FILES más abajo. state/journal.md NO está en esta
+      lista: el agente sigue pudiendo journalear libremente, siempre
+      que no mencione ninguno de los cuatro archivos protegidos.
+      `scripts/reconcile.py --done` sigue siendo la única vía para
+      borrar el flag de reconciliación (verifica el journal antes).
   (D) WP4/N4a: asignar ETOROAGENT_RUN_ID o ETOROAGENT_STATE_DIR inline
       (export o prefijo VAR=valor) en un comando que además invoque
       scripts/place_order.py, scripts/snapshot.py, scripts/candles.py o
@@ -144,12 +155,17 @@ MENSAJE_GUARDRAIL = (
 
 MENSAJE_ESTADO_PROTEGIDO = (
     "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): "
-    "state/.run_orders.json y state/.needs_reconciliation son archivos de "
-    "control -- de solo lectura para el agente via Bash (incluido `rm`). "
-    "Para cerrar una reconciliacion pendiente usa "
-    "`.venv/bin/python scripts/reconcile.py --done` (verifica el journal "
-    "antes de borrar el flag). El journaling normal hacia state/journal.md "
-    "y reports/ sigue permitido.\n"
+    "state/.run_orders.json, state/.needs_reconciliation, "
+    "state/positions.json y state/equity.csv son archivos de control -- "
+    "DEFAULT-DENY (WP6): cualquier comando Bash que los MENCIONE se "
+    "bloquea, salvo (a) invocar scripts/place_order.py, "
+    "scripts/snapshot.py, scripts/candles.py o scripts/reconcile.py, o "
+    "(b) una lectura pura y COMPLETA (cat/head/tail/less/more/wc/ls/stat/"
+    "grep/diff, o `python3 -m json.tool`), sin ningun otro operador de "
+    "shell en el mismo comando. Para cerrar una reconciliacion pendiente "
+    "usa `.venv/bin/python scripts/reconcile.py --done`. El journaling "
+    "normal hacia state/journal.md sigue permitido mientras no mencione "
+    "ninguno de esos cuatro archivos.\n"
 )
 
 MENSAJE_ENV_SPOOF = (
@@ -614,134 +630,6 @@ def _escribe_sobre_guardrail(segmento: str) -> bool:
     return False
 
 
-# -- Escritura de shell sobre archivos de ESTADO protegidos (WP4/N3c) ------
-#
-# state/.run_orders.json (presupuesto de ordenes) y
-# state/.needs_reconciliation (flag de reconciliacion) son archivos de
-# CONTROL, no de journaling libre -- a diferencia del resto de state/
-# (positions.json, equity.csv, journal.md), que el agente lee/journalea
-# normalmente. Si el agente pudiera borrarlos/reescribirlos por Bash, el
-# protocolo de reconciliacion (y el presupuesto de ordenes) serian honor
-# system. scripts/reconcile.py --done es la unica via autorizada para
-# borrar el flag de reconciliacion (verifica el journal antes).
-#
-# A diferencia de _PROTEGIDO_RE (guardrails de codigo), aca SI se
-# considera `rm` un verbo de escritura -- de hecho el mas relevante: es
-# justamente como se evadia el honor system antes de este fix. No se
-# agrega `rm` a la lista general de guardrails de codigo a proposito
-# (fuera de alcance de este fix especifico).
-_ESTADO_PROTEGIDO_RE = re.compile(
-    r"state/\.run_orders\.json|state/\.needs_reconciliation"
-)
-_RM_RE = re.compile(r"\brm\b")
-
-_OPERADORES_ESCRITURA_ESTADO = _OPERADORES_ESCRITURA_ARCHIVO + (_RM_RE,)
-
-# Documentar esta protección (docstrings, PLAYBOOK.md, commits) inevitablemente
-# menciona "rm state/.needs_reconciliation" como PROSA -- una convención común
-# es envolver ese texto entre backticks (formato markdown de código inline).
-# Backtick es ADEMÁS sintaxis real de shell (command substitution): un operador
-# mencionado ASÍ (`rm X`) nunca es una invocación real de la forma en que este
-# hook necesita detectar (una invocación real jamás envuelve el NOMBRE del
-# comando entre backticks). Detectar esto evita el falso positivo sin abrir una
-# vía nueva: una sustitución de comando real detrás de backticks ya es, como el
-# resto de construcciones de shell no evaluadas por este hook (expansión de
-# variables, eval, base64|bash...), un bypass residual aceptado (ver docstring
-# del módulo) -- no una protección que este fix relaje.
-_BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
-
-
-def _enmascarar_cuerpos_de_heredoc(segmento: str) -> str:
-    """Reemplaza el CONTENIDO (cuerpo) de cada heredoc (<<DELIM ...
-    DELIM) del segmento por espacios, preservando todo lo demas verbatim
-    -- incluida la linea `<<DELIM` de apertura (con el operador y su
-    destino real, si los hay) y el delimitador de cierre. Un heredoc es
-    DATA que el shell redirige a stdin del comando (tipicamente
-    cat/tee escribiendo a state/journal.md, o -- en los propios tests de
-    este hook -- a un archivo de test), nunca texto de COMANDOS nuevos
-    para el resto del segmento. Enmascarar su cuerpo evita que una
-    mencion de un operador (p.ej. "rm") como DATO/prosa DENTRO del
-    cuerpo (un ejemplo de test, una entrada de journal citando esta
-    misma proteccion) se confunda con una invocacion real -- sin afectar
-    la deteccion del operador+destino que aparecen ANTES del marcador
-    `<<` (esa parte no se toca). Residual aceptado, igual que el resto
-    de construcciones de shell no evaluadas por este hook: un heredoc
-    piped a `bash`/`sh` SIN `-c` (que SI ejecutaria su cuerpo como
-    comandos) queda fuera de esta deteccion -- ver docstring del modulo.
-    """
-    resultado = list(segmento)
-    quote = None
-    i = 0
-    n = len(segmento)
-    while i < n:
-        ch = segmento[i]
-        if quote:
-            if ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            i += 1
-            continue
-        if segmento.startswith("<<", i):
-            match = _HEREDOC_START_RE.match(segmento, i)
-            if match:
-                delim = match.group(2)
-                end = match.end()
-                i = end
-                closing_re = re.compile(r"(?m)^[ \t]*" + re.escape(delim) + r"[ \t]*$")
-                closing_match = closing_re.search(segmento, i)
-                body_end = closing_match.start() if closing_match else n
-                for j in range(i, body_end):
-                    resultado[j] = " "
-                i = closing_match.end() if closing_match else n
-                continue
-        i += 1
-    return "".join(resultado)
-
-
-def _region_apunta_a_estado_protegido(segmento: str, desde: int) -> bool:
-    region = _region_objetivo(segmento, desde)
-    return bool(
-        _ESTADO_PROTEGIDO_RE.search(region)
-        or _ESTADO_PROTEGIDO_RE.search(_normalizar(region))
-        or _ESTADO_PROTEGIDO_RE.search(_normalizar_sin_concat(region))
-    )
-
-
-def _escribe_sobre_estado_protegido(segmento: str) -> bool:
-    """Mismo mecanismo que _escribe_sobre_guardrail (operador de escritura
-    -> region objetivo despues de el -> matchea la ruta protegida), pero
-    contra _ESTADO_PROTEGIDO_RE y con `rm` incluido como operador. Un
-    operador cuyo propio NOMBRE cae dentro de un span entre backticks se
-    descarta (prosa/markdown, no invocación real) -- ver comentario de
-    _BACKTICK_SPAN_RE arriba. Un ARGUMENTO citado de una invocación real
-    (p.ej. rm "state/.needs_reconciliation", sin backticks sobre `rm`)
-    sigue detectándose igual: solo se ignora el operador en sí, no la
-    región objetivo que viene después."""
-    base = _enmascarar_cuerpos_de_heredoc(segmento)
-    for variante in (
-        base,
-        _normalizar(base),
-        _normalizar_sin_concat(base),
-    ):
-        backtick_spans = list(_BACKTICK_SPAN_RE.finditer(variante))
-        for operador_re in _OPERADORES_ESCRITURA_ESTADO:
-            for m in operador_re.finditer(variante):
-                if any(s.start() <= m.start() < s.end() for s in backtick_spans):
-                    continue
-                if _region_apunta_a_estado_protegido(variante, m.end()):
-                    return True
-
-    enmascarado = _enmascarar_citas(segmento)
-    for m in _REDIR_RE.finditer(enmascarado):
-        if _region_apunta_a_estado_protegido(segmento, m.end()):
-            return True
-
-    return False
-
-
 _ENV_SPOOF_ASSIGN_RE = re.compile(
     r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR)\s*="
 )
@@ -750,47 +638,94 @@ _ENV_SPOOF_SCRIPT_RE = re.compile(
 )
 
 
-# -- Interpretes alternativos que evaden los operadores de shell vigilados -
-# -- (WP5/N8) -------------------------------------------------------------
+# -- Archivos de ESTADO CRITICOS: DEFAULT-DENY por MENCION (WP6/N11+N8) ----
 #
-# _escribe_sobre_estado_protegido (arriba) detecta OPERADORES DE SHELL de
-# escritura/borrado (tee/mv/rm/etc) seguidos del path protegido. Pero un
-# interprete (python3 -c, perl -e, ruby -e) que invoca una funcion de
-# borrado DENTRO del lenguaje (os.remove(...), unlink(...), File.delete),
-# o `find ... -delete`, no usa NINGUNO de esos operadores de shell -- el
-# borrado ocurre adentro del interprete, invisible a esa deteccion por
-# operador+region. Vectores reales que esto cierra: `python3 -c
-# "import os; os.remove('state/.run_orders.json')"`, `perl -e
-# "unlink('state/.needs_reconciliation')"`, `find state -name
-# .needs_reconciliation -delete`, y variantes que reconstruyen el mismo
-# ataque via xargs/eval.
+# Historia: WP4/N3c bloqueaba OPERADORES DE SHELL de escritura/borrado
+# (tee/mv/rm/etc) seguidos del path protegido. WP5/N8 amplio esto a
+# interpretes alternativos (python3 -c con os.remove(...), perl -e con
+# unlink(...), find -delete) enumerando VEHICULOS de ejecucion/borrado
+# conocidos -- pero una lista negra de vehiculos NUNCA converge: cada
+# ronda de re-auditoria encontro un vehiculo nuevo no enumerado (rm ->
+# python -c -> node -e/heredoc). WP6/N11 invierte la estrategia: en vez
+# de enumerar que esta PROHIBIDO, se enumera que esta PERMITIDO (dos
+# excepciones angostas) y todo lo demas que MENCIONE uno de los archivos
+# protegidos se bloquea por default -- sin necesidad de enumerar
+# vehiculos, asi que un vehiculo nuevo (node, awk, sqlite3, lo que sea)
+# ya queda cerrado sin tener que agregarlo a ninguna lista.
 #
-# Regla, deliberadamente mas amplia y menos precisa que la de operador+
-# region: un segmento que MENCIONE uno de los dos archivos de control
-# (".run_orders" o ".needs_reconciliation", substring -- sin exigir el
-# prefijo "state/", para cubrir tambien `find state -name
-# .needs_reconciliation -delete`, donde el path no aparece contiguo) Y
-# ademas contenga un VEHICULO de ejecucion o borrado (python/perl/ruby/
-# sh -c/bash -c/find/xargs/eval/rm/unlink/shred/dd) se bloquea -- salvo
-# que el segmento sea una invocacion real de uno de los 4 scripts
-# autorizados (place_order.py/snapshot.py/candles.py/reconcile.py), que
-# legitimamente pueden mencionar estos archivos en su propio texto (p.ej.
-# un --reason que los cite) sin que eso sea un intento de evadirlos.
-# Lecturas puras (cat/ls/grep/head/tail, sin ninguno de esos vehiculos)
-# siguen permitidas -- no llevan ningun token de la lista.
+# N11: PROTECTED_STATE_FILES ahora tambien incluye positions.json y
+# equity.csv -- son los INPUTS de los seis limites duros de risk.py (25%
+# posicion, 35% cripto, stop-loss, drawdown, no-duplicacion, 70%
+# agregado): reescribirlos con un simple `echo > state/positions.json`
+# falsea el state que validate() ve, sin pasar por ninguno de los dos
+# archivos de CONTROL que ya se protegian. state/journal.md NO esta en
+# esta lista a proposito: el agente debe poder seguir appendeando su
+# diario libremente (tee -a/printf >>), siempre que el comando no
+# MENCIONE ademas alguno de los cuatro archivos protegidos -- ver
+# docstring del modulo y MENSAJE_ESTADO_PROTEGIDO.
 #
-# Mismo criterio de heredoc-body y backtick-operador que
-# _escribe_sobre_estado_protegido (ver _enmascarar_cuerpos_de_heredoc y
-# _BACKTICK_SPAN_RE): un heredoc que journalea/documenta estos nombres
-# como DATO, o una mencion en prosa envuelta entre backticks, no cuenta
-# como invocacion real.
-_ARCHIVO_PROTEGIDO_MENCION_RE = re.compile(
-    r"\.run_orders|\.needs_reconciliation"
+# Regla: un segmento que MENCIONE uno de los cuatro nombres (crudo o en
+# las copias normalizadas sin comillas/backslashes, con y sin operador de
+# concatenacion "+" -- ver _normalizar/_normalizar_sin_concat) se bloquea
+# por DEFAULT, salvo:
+#   (a) invocacion real de uno de los 4 scripts autorizados
+#       (place_order.py/snapshot.py/candles.py/reconcile.py) -- sus
+#       lineas de comando normales no mencionan estos archivos; la
+#       excepcion es por si un --flag futuro los nombra (p.ej. un
+#       --reason que cite state/.run_orders.json).
+#   (b) una lectura PURA y COMPLETA: el segmento entero (sin pipes,
+#       redireccion, heredoc, backticks o expansion $(...) -- CUALQUIERA
+#       de esos saca al comando de esta excepcion, fail-closed) es una
+#       invocacion de cat/head/tail/less/more/wc/ls/stat/grep/diff, o de
+#       `python3 -m json.tool`. `cat x | bash` tiene un pipe -> NO es una
+#       lectura pura -> sigue bloqueado.
+#
+# Deliberadamente NO hay excepcion para prosa entre backticks ni para
+# contenido DENTRO de un heredoc (a diferencia de WP4/N3c y WP5/N8): un
+# comando que documente/journalee estos nombres (`tee -a state/journal.md
+# <<EOF ... menciona state/.needs_reconciliation ... EOF`) tambien se
+# bloquea por default -- ver tests. Costo aceptado a proposito para
+# cerrar el hueco de enumeracion: documentar esta proteccion o journalear
+# una entrada que se refiera a estos archivos debe evitar nombrarlos
+# literalmente (p.ej. "el flag de reconciliacion" en vez de
+# "state/.needs_reconciliation").
+PROTECTED_STATE_FILES = (
+    ".run_orders",
+    ".needs_reconciliation",
+    "positions.json",
+    "equity.csv",
 )
-_VEHICULO_EJECUCION_O_BORRADO_RE = re.compile(
-    r"\b(python3?|perl|ruby|find|xargs|eval|rm|unlink|shred|dd)\b"
-    r"|\b(?:sh|bash)\s+-c\b"
+
+_MENCION_ESTADO_PROTEGIDO_RE = re.compile(
+    "|".join(re.escape(nombre) for nombre in PROTECTED_STATE_FILES)
 )
+
+# Excepcion (b): ancla ^ (el comando ENTERO, sin nada antes) y exige que
+# NO aparezca ningun otro operador de shell en el mismo segmento -- pipe,
+# redireccion, backtick o expansion $(...) (& y ; residuales tambien
+# descalifican, aunque _split_segments ya particiona por && / || / ;).
+# Fail-closed: ante cualquier duda, no es una lectura "pura" -> no aplica
+# la excepcion -> cae al default-deny de mas abajo. El chequeo de
+# operadores se hace sobre el segmento con las CITAS enmascaradas
+# (_enmascarar_citas, mismo helper que usa el resto del hook para `>` real
+# vs citado): un patron de grep como "a\|b" trae un `|` LITERAL dentro de
+# comillas -- eso no es un pipe de shell real y no debe descalificar la
+# excepcion. Los heredocs se copian intactos por _enmascarar_citas (no se
+# enmascaran), asi que un `<<` real (que si descalifica) se sigue
+# detectando.
+_LECTURA_SEGURA_ESTADO_INICIO_RE = re.compile(
+    r"^(?:cat|head|tail|less|more|wc|ls|stat|grep|diff)\s"
+    r"|^python3?\s+-m\s+json\.tool\s"
+)
+_OPERADOR_ADICIONAL_RE = re.compile(r"[|&;<>`$]")
+
+
+def _es_lectura_segura_de_estado(segmento: str) -> bool:
+    texto = segmento.strip()
+    enmascarado = _enmascarar_citas(texto).strip()
+    if _OPERADOR_ADICIONAL_RE.search(enmascarado):
+        return False
+    return bool(_LECTURA_SEGURA_ESTADO_INICIO_RE.match(enmascarado))
 
 
 def _script_autorizado_presente(segmento: str) -> bool:
@@ -800,17 +735,9 @@ def _script_autorizado_presente(segmento: str) -> bool:
     return False
 
 
-def _bloqueado_interprete_alternativo(segmento: str) -> bool:
-    if _script_autorizado_presente(segmento):
-        return False
-    base = _enmascarar_cuerpos_de_heredoc(segmento)
-    for variante in (base, _normalizar(base), _normalizar_sin_concat(base)):
-        if not _ARCHIVO_PROTEGIDO_MENCION_RE.search(variante):
-            continue
-        backtick_spans = list(_BACKTICK_SPAN_RE.finditer(variante))
-        for m in _VEHICULO_EJECUCION_O_BORRADO_RE.finditer(variante):
-            if any(s.start() <= m.start() < s.end() for s in backtick_spans):
-                continue
+def _menciona_estado_protegido(segmento: str) -> bool:
+    for variante in (segmento, _normalizar(segmento), _normalizar_sin_concat(segmento)):
+        if _MENCION_ESTADO_PROTEGIDO_RE.search(variante):
             return True
     return False
 
@@ -878,10 +805,13 @@ def _bloqueado_guardrail(command: str) -> bool:
 
 def _bloqueado_estado_protegido(command: str) -> bool:
     for segmento in _split_segments(command):
-        if _escribe_sobre_estado_protegido(segmento):
-            return True
-        if _bloqueado_interprete_alternativo(segmento):
-            return True
+        if not _menciona_estado_protegido(segmento):
+            continue
+        if _script_autorizado_presente(segmento):
+            continue  # excepcion (a)
+        if _es_lectura_segura_de_estado(segmento):
+            continue  # excepcion (b)
+        return True
     return False
 
 

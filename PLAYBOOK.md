@@ -116,6 +116,17 @@ abras posiciones en esta corrida** (los cierres por señal de salida siguen
 permitidos igual). No intentes borrar el flag hasta haber journaleado la
 `RECONCILIACION` -- `reconcile.py --done` lo va a rechazar igual si no está.
 
+**Nota (WP6):** `scripts/risk_hook.py` bloquea por default cualquier
+comando Bash que MENCIONE (como texto, no solo como destino de escritura)
+alguno de los cuatro archivos de control -- `state/.run_orders.json`,
+`state/.needs_reconciliation`, `state/positions.json`, `state/equity.csv`
+-- salvo una lectura pura (`cat`/`grep`/etc.) o invocar uno de los 4
+scripts autorizados. Al journalear (paso 3) o en cualquier `--reason`,
+referite a estos archivos de forma descriptiva ("el flag de
+reconciliación", "el presupuesto de órdenes") en vez de nombrarlos
+literalmente -- nombrarlos bloquea el comando Bash aunque el destino real
+sea `state/journal.md`.
+
 ## Universo operable
 
 Universo cerrado: exactamente los símbolos definidos en `UNIVERSE` de
