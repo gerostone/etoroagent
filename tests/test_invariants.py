@@ -16,6 +16,7 @@ tests no puedan quedar "verdes" por una refactorización que rompa cómo esas
 piezas se combinan en producción.
 """
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -463,3 +464,95 @@ def test_dry_run_exactamente_0_habilita_la_llamada_real(tmp_path, monkeypatch):
     )
     assert rc == 0
     client.open_position_by_amount.assert_called_once()
+
+
+# ============================================================================
+# Invariante 8 (WP6/N11): ningún comando Bash que mencione un archivo de
+# PROTECTED_STATE_FILES con un operador de escritura o vehículo de
+# ejecución pasa el hook scripts/risk_hook.py.
+# ============================================================================
+#
+# Garantía: los cuatro archivos de estado crítico (state/.run_orders.json
+# -- presupuesto de órdenes; state/.needs_reconciliation -- flag de
+# reconciliación; state/positions.json y state/equity.csv -- los INPUTS de
+# los seis límites duros de risk.py) están protegidos por DEFAULT-DENY por
+# mención (WP6): a diferencia del diseño anterior (WP4/N3c: operadores de
+# shell conocidos; WP5/N8: vehículos de ejecución/borrado conocidos, una
+# lista que nunca convergió -- cada ronda de auditoría encontró un
+# vehículo nuevo: rm -> python -c -> node -e/heredoc), ahora se enumera
+# lo PERMITIDO (dos excepciones angostas) en vez de lo prohibido, así que
+# un vehículo futuro no enumerado (awk, sqlite3, lo que sea) queda
+# cerrado sin tener que agregarlo a ninguna lista.
+#
+# Invoca el hook REAL vía subprocess (como lo hace Claude Code, y como ya
+# lo hacen los tests de tests/test_risk_hook.py) en vez de importar
+# funciones internas -- así este invariante no puede quedar "verde" por
+# una reimplementación de la lógica de bloqueo que diverja de lo que el
+# hook realmente hace en producción.
+
+_RISK_HOOK_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "risk_hook.py"
+
+
+def _run_risk_hook(command: str) -> subprocess.CompletedProcess:
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    return subprocess.run(
+        ["python3", str(_RISK_HOOK_SCRIPT)], input=payload, capture_output=True, text=True
+    )
+
+
+_VECTORES_ESCRITURA_O_BORRADO_SOBRE_ESTADO_PROTEGIDO = [
+    pytest.param("rm state/.needs_reconciliation", id="rm_needs_reconciliation"),
+    pytest.param(
+        "python3 -c \"import os; os.remove('state/.run_orders.json')\"",
+        id="python_c_os_remove_run_orders",
+    ),
+    pytest.param(
+        "perl -e \"unlink('state/.needs_reconciliation')\"",
+        id="perl_e_unlink_needs_reconciliation",
+    ),
+    pytest.param("find state -name .run_orders.json -delete", id="find_delete_run_orders"),
+    pytest.param(
+        "node -e \"require('fs').unlinkSync('state/positions.json')\"",
+        id="node_e_unlink_sync_positions_json",
+    ),
+    pytest.param(
+        "python3 - <<EOF\nimport os\nos.remove('state/equity.csv')\nEOF",
+        id="heredoc_python_os_remove_equity_csv",
+    ),
+    pytest.param("echo x > state/positions.json", id="redireccion_sobre_positions_json"),
+    pytest.param("mv fake.json state/equity.csv", id="mv_sobre_equity_csv"),
+    pytest.param("cp fake.json state/.run_orders.json", id="cp_sobre_run_orders"),
+    pytest.param(
+        "echo state/.needs_reconciliation | xargs rm", id="xargs_rm_needs_reconciliation"
+    ),
+    pytest.param("eval \"rm state/positions.json\"", id="eval_rm_positions_json"),
+    pytest.param("dd if=/dev/null of=state/equity.csv", id="dd_of_equity_csv"),
+]
+
+
+@pytest.mark.parametrize(
+    "command", _VECTORES_ESCRITURA_O_BORRADO_SOBRE_ESTADO_PROTEGIDO
+)
+def test_hook_bloquea_todo_vector_de_escritura_o_borrado_sobre_estado_protegido(command):
+    r = _run_risk_hook(command)
+    assert r.returncode == 2, (
+        f"el hook debia bloquear (rc==2) el comando: {command!r} -- salio "
+        f"rc={r.returncode}, stderr={r.stderr!r}"
+    )
+
+
+def test_hook_permite_lecturas_puras_y_journaling_que_no_mencionan_estado_protegido():
+    # Control negativo: el invariante de arriba no debe poder satisfacerse
+    # trivialmente por un hook roto que bloquee TODO. Confirma que las
+    # lecturas puras (excepción b) y el journaling normal (que no
+    # menciona ninguno de los cuatro archivos) siguen pasando.
+    for command in [
+        "cat state/positions.json",
+        "grep BTC state/positions.json",
+        "python3 -m json.tool state/positions.json",
+        "tail state/equity.csv",
+        ".venv/bin/pytest tests/ -q",
+        "printf -- '- ts DRY_RUN | open QQQ\\n' >> state/journal.md",
+    ]:
+        r = _run_risk_hook(command)
+        assert r.returncode == 0, f"{command!r} debia pasar, salio rc={r.returncode}"
