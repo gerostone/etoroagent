@@ -98,15 +98,23 @@ snapshot** es reconciliar, antes de cualquier otro análisis:
 3. Journaleás una entrada `RECONCILIACION` con el resultado, aunque sea "sin
    discrepancias" — la ausencia de hallazgos también es información de
    auditoría.
-4. Recién entonces eliminás `state/.needs_reconciliation` y continuás la
+4. Recién entonces corré `.venv/bin/python scripts/reconcile.py --done` --
+   NO borres `state/.needs_reconciliation` a mano (`rm`, redirección,
+   etc.): `scripts/risk_hook.py` bloquea esas escrituras de shell
+   directas sobre ese archivo (WP4/N3), y de todos modos `reconcile.py
+   --done` es lo que verifica que el paso 3 quedó journaleado antes de
+   borrar nada. Si el archivo sigue existiendo después de correrlo, leé
+   el motivo en stderr (por lo general: falta la entrada
+   `RECONCILIACION`, o su timestamp no es posterior al aborto) y
+   journaleala antes de reintentar. Recién con exit 0 continuás la
    corrida con normalidad.
 
 Mientras el archivo exista, `scripts/place_order.py` bloquea toda apertura
 (`exit 2`) — los cierres siguen permitidos, es la dirección fail-safe. Si el
 paso 2 encuentra discrepancias que no podés explicar con confianza: **NO
 abras posiciones en esta corrida** (los cierres por señal de salida siguen
-permitidos igual). No borres el flag hasta haber journaleado la
-`RECONCILIACION`.
+permitidos igual). No intentes borrar el flag hasta haber journaleado la
+`RECONCILIACION` -- `reconcile.py --done` lo va a rechazar igual si no está.
 
 ## Universo operable
 

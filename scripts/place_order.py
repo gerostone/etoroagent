@@ -253,13 +253,26 @@ def _today_local() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
+class _OrderBudgetCorruptError(Exception):
+    """WP4/N3(a) (re-auditoría): state/.run_orders.json EXISTE pero es
+    ilegible/corrupto (JSON inválido, no es un objeto, o count/dailyCount
+    tienen un tipo inesperado). Antes de este fix, _load_order_budget()
+    devolvía contadores en 0 ante esto -- presupuesto "lleno" de nuevo,
+    fail-OPEN. Puede ser corrupción real de disco o manipulación del
+    agente (aunque risk_hook.py ya bloquea escrituras de shell directas
+    sobre este archivo, ver WP4/N3c) -- en cualquier caso, requiere
+    intervención manual, nunca un reset silencioso. Un archivo AUSENTE
+    (nunca se ejecutó una orden aún) NO es corrupción -- ver
+    _load_order_budget()."""
+
+
 def _load_order_budget(state_dir: Path) -> dict:
-    """Lee state/.run_orders.json. Fail-safe (no fail-closed): archivo
-    ausente, corrupto, o con campos de tipo inesperado -> presupuesto
-    "vacío" (contadores en 0), nunca una excepción -- un presupuesto
-    ilegible no debe tumbar toda la corrida, a diferencia de positions.json
-    (regla de negocio distinta: esto es un contador operativo, no el
-    estado real del portfolio)."""
+    """Lee state/.run_orders.json. Archivo AUSENTE (caso normal: nunca se
+    ejecutó una orden todavía) -> presupuesto "vacío" (contadores en 0).
+    Archivo PRESENTE pero ilegible/corrupto/con tipos inesperados ->
+    _OrderBudgetCorruptError (WP4/N3a, fail-closed para aperturas -- ver
+    _check_order_budget). NO fail-safe silencioso: distinto de la versión
+    anterior a N3a, que colapsaba ambos casos al mismo default."""
     default = {"runId": None, "count": 0, "date": None, "dailyCount": 0}
     path = state_dir / ORDER_BUDGET_FILE
     if not path.exists():
@@ -267,21 +280,25 @@ def _load_order_budget(state_dir: Path) -> dict:
     try:
         with open(path) as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return default
+    except (json.JSONDecodeError, OSError) as exc:
+        raise _OrderBudgetCorruptError(f"{path} corrupto/ilegible: {exc}") from exc
     if not isinstance(data, dict):
-        return default
+        raise _OrderBudgetCorruptError(f"{path} no es un objeto JSON válido: {data!r}")
     count = data.get("count", 0)
     daily_count = data.get("dailyCount", 0)
+    if not (isinstance(count, int) and not isinstance(count, bool)):
+        raise _OrderBudgetCorruptError(
+            f"{path}: campo 'count' con tipo inesperado: {count!r}"
+        )
+    if not (isinstance(daily_count, int) and not isinstance(daily_count, bool)):
+        raise _OrderBudgetCorruptError(
+            f"{path}: campo 'dailyCount' con tipo inesperado: {daily_count!r}"
+        )
     return {
         "runId": data.get("runId"),
-        "count": count if isinstance(count, int) and not isinstance(count, bool) else 0,
+        "count": count,
         "date": data.get("date"),
-        "dailyCount": (
-            daily_count
-            if isinstance(daily_count, int) and not isinstance(daily_count, bool)
-            else 0
-        ),
+        "dailyCount": daily_count,
     }
 
 
@@ -309,11 +326,20 @@ def _save_order_budget(state_dir: Path, budget: dict) -> None:
 def _check_order_budget(state_dir: Path) -> str:
     """Solo lectura: no incrementa ni persiste nada (eso es
     _consume_order_budget, llamado recién cuando una orden se ejecuta de
-    verdad). Devuelve un mensaje de bloqueo si el presupuesto por corrida
-    (con ETOROAGENT_RUN_ID seteada) o el diario (siempre) está agotado, o
-    "" si hay presupuesto disponible."""
+    verdad). Devuelve un mensaje de bloqueo si el presupuesto por corrida,
+    el diario, o el archivo mismo (WP4/N3a: corrupto/ilegible ->
+    fail-closed) está agotado/inválido, o "" si hay presupuesto
+    disponible."""
     run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
-    budget = _normalize_order_budget(_load_order_budget(state_dir), run_id, _today_local())
+    try:
+        budget = _normalize_order_budget(
+            _load_order_budget(state_dir), run_id, _today_local()
+        )
+    except _OrderBudgetCorruptError as exc:
+        return (
+            "presupuesto ilegible: intervenci\u00f3n manual -- restaur\u00e1 o "
+            f"borr\u00e1 {ORDER_BUDGET_FILE} ({exc})"
+        )
 
     if run_id is not None and budget["count"] >= MAX_ORDERS_PER_RUN:
         return f"tope de {MAX_ORDERS_PER_RUN} órdenes por corrida alcanzado"
@@ -325,9 +351,21 @@ def _check_order_budget(state_dir: Path) -> str:
 def _consume_order_budget(state_dir: Path) -> None:
     """Incrementa el presupuesto tras UNA orden efectivamente ejecutada
     (dry-run, real, o de resultado AMBIGUO -- ver docstring del módulo,
-    regla 15). Los bloqueos (exit 2) nunca llegan a llamar esto."""
+    regla 15). Los bloqueos (exit 2) nunca llegan a llamar esto -- en
+    particular, _check_order_budget() ya habría bloqueado ANTES si el
+    archivo estaba corrupto, así que en el camino normal esto nunca ve
+    _OrderBudgetCorruptError. Por las dudas (carrera improbable: el
+    archivo se corrompe justo entre el check y el consume), no perdemos
+    el registro de una orden que YA se envió -- arrancamos de un
+    presupuesto fresco en vez de propagar la excepción después del hecho
+    (la orden ya fue journaleada por el caller antes de esta llamada)."""
     run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
-    budget = _normalize_order_budget(_load_order_budget(state_dir), run_id, _today_local())
+    today = _today_local()
+    try:
+        loaded = _load_order_budget(state_dir)
+    except _OrderBudgetCorruptError:
+        loaded = {"runId": None, "count": 0, "date": None, "dailyCount": 0}
+    budget = _normalize_order_budget(loaded, run_id, today)
     if run_id is not None:
         budget["count"] = budget["count"] + 1
     budget["dailyCount"] = budget["dailyCount"] + 1

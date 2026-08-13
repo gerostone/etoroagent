@@ -1381,3 +1381,98 @@ def test_cierre_pasa_con_presupuesto_diario_agotado(tmp_path, monkeypatch):
     )
     assert rc_close == 0
     client_close.close_position.assert_called_once()
+
+
+# -- WP4/N3(a): presupuesto corrupto/ilegible -> fail-closed para aperturas --
+#
+# Re-auditoría: state/.run_orders.json ilegible (JSON inválido, o campos
+# con tipo inesperado) hacía que _load_order_budget() devolviera contadores
+# en 0 -- presupuesto "lleno" de nuevo (fail-OPEN). Fix: un archivo
+# PRESENTE pero corrupto se trata como presupuesto AGOTADO para aperturas
+# (exit 2, requiere intervención manual). Un archivo AUSENTE (nunca se
+# corrió una orden aún) sigue siendo el caso normal, contadores en 0.
+
+
+def test_presupuesto_corrupto_bloquea_apertura_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    (state_dir / ".run_orders.json").write_text("{esto no es json")
+
+    client = MagicMock()
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.search_instrument.assert_not_called()
+    client.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "presupuesto ilegible" in journal
+    # El archivo corrupto no se toca/sobreescribe silenciosamente.
+    assert (state_dir / ".run_orders.json").read_text() == "{esto no es json"
+
+
+def test_presupuesto_con_tipo_inesperado_en_count_bloquea_apertura(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    (state_dir / ".run_orders.json").write_text(
+        json.dumps({"runId": "x", "count": "tres", "date": None, "dailyCount": 0})
+    )
+
+    client = MagicMock()
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    client.search_instrument.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "presupuesto ilegible" in journal
+
+
+def test_presupuesto_no_es_un_objeto_json_bloquea_apertura(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    (state_dir / ".run_orders.json").write_text(json.dumps([1, 2, 3]))
+
+    client = MagicMock()
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "presupuesto ilegible" in journal
+
+
+def test_presupuesto_corrupto_no_bloquea_cierre(tmp_path, monkeypatch):
+    # post-N1: los cierres ni siquiera chequean presupuesto -- pasan aunque
+    # el archivo esté corrupto.
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _closable_state_dir(tmp_path)
+    (state_dir / ".run_orders.json").write_text("{esto no es json")
+
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+    rc = place_order.main(
+        ["close", "--position-id", "pos-close", "--symbol", "GLD"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+    assert rc == 0
+    client.close_position.assert_called_once()
+
+
+def test_presupuesto_ausente_no_es_corrupcion_primera_orden_pasa(tmp_path, monkeypatch):
+    # Control: archivo AUSENTE (nunca se corrió una orden aún) es el caso
+    # normal -- no debe tratarse como corrupción.
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+    assert not (state_dir / ".run_orders.json").exists()
+
+    rc, client = _open_ok(state_dir, "SPY", instrument_id=1)
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()

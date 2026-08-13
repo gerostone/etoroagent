@@ -25,6 +25,24 @@ la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
       §Cierre de corrida) sigue permitido: la regla mira el DESTINO de la
       escritura, no la sola presencia de `tee`/`>>` en el comando.
 
+  (C) WP4/N3: escrituras de shell (incluido `rm`) sobre los archivos de
+      CONTROL state/.run_orders.json (presupuesto de órdenes) y
+      state/.needs_reconciliation (flag de reconciliación). A diferencia
+      del resto de state/ (positions.json, equity.csv, journal.md, que el
+      agente journalea/lee libremente), estos dos son de solo lectura por
+      Bash -- si el agente pudiera `rm state/.needs_reconciliation`, el
+      protocolo de reconciliación de PLAYBOOK.md sería honor system puro.
+      `scripts/reconcile.py --done` es la única vía autorizada para
+      borrar el flag (verifica el journal antes -- ver su docstring).
+  (D) WP4/N4a: asignar ETOROAGENT_RUN_ID o ETOROAGENT_STATE_DIR inline
+      (export o prefijo VAR=valor) en un comando que además invoque
+      scripts/place_order.py, scripts/snapshot.py, scripts/candles.py o
+      scripts/reconcile.py. runner.sh setea estas variables por entorno
+      heredado, antes de invocar `claude` -- el agente nunca necesita
+      asignarlas inline. Si pudiera, resetearía a voluntad el presupuesto
+      de órdenes por corrida (WP1) o redirigiría state/ para evadir la
+      reconciliación pendiente (WP2) o el presupuesto (WP1).
+
 Vias de LECTURA autorizadas (no las bloquea, no necesitan caso especial:
 su invocacion normal no contiene ningun patron vigilado en el texto del
 comando): `scripts/snapshot.py` (estado del portfolio) y
@@ -122,6 +140,26 @@ MENSAJE_GUARDRAIL = (
     "por Bash. El journaling normal hacia state/ y reports/ (tee, >>) sigue "
     "permitido: revisa que el DESTINO del comando sea uno de esos dos "
     "directorios, no un guardrail.\n"
+)
+
+MENSAJE_ESTADO_PROTEGIDO = (
+    "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): "
+    "state/.run_orders.json y state/.needs_reconciliation son archivos de "
+    "control -- de solo lectura para el agente via Bash (incluido `rm`). "
+    "Para cerrar una reconciliacion pendiente usa "
+    "`.venv/bin/python scripts/reconcile.py --done` (verifica el journal "
+    "antes de borrar el flag). El journaling normal hacia state/journal.md "
+    "y reports/ sigue permitido.\n"
+)
+
+MENSAJE_ENV_SPOOF = (
+    "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): no se permite "
+    "asignar ETOROAGENT_RUN_ID ni ETOROAGENT_STATE_DIR inline (export o "
+    "prefijo VAR=valor) en un comando que invoque scripts/place_order.py, "
+    "scripts/snapshot.py, scripts/candles.py o scripts/reconcile.py -- esas "
+    "variables las setea runner.sh por entorno heredado, nunca el agente. "
+    "Asignarlas inline evade el presupuesto de ordenes por corrida y/o "
+    "el aislamiento de state usado en tests.\n"
 )
 
 API_DOMAIN = "public-api.etoro.com"
@@ -576,6 +614,171 @@ def _escribe_sobre_guardrail(segmento: str) -> bool:
     return False
 
 
+# -- Escritura de shell sobre archivos de ESTADO protegidos (WP4/N3c) ------
+#
+# state/.run_orders.json (presupuesto de ordenes) y
+# state/.needs_reconciliation (flag de reconciliacion) son archivos de
+# CONTROL, no de journaling libre -- a diferencia del resto de state/
+# (positions.json, equity.csv, journal.md), que el agente lee/journalea
+# normalmente. Si el agente pudiera borrarlos/reescribirlos por Bash, el
+# protocolo de reconciliacion (y el presupuesto de ordenes) serian honor
+# system. scripts/reconcile.py --done es la unica via autorizada para
+# borrar el flag de reconciliacion (verifica el journal antes).
+#
+# A diferencia de _PROTEGIDO_RE (guardrails de codigo), aca SI se
+# considera `rm` un verbo de escritura -- de hecho el mas relevante: es
+# justamente como se evadia el honor system antes de este fix. No se
+# agrega `rm` a la lista general de guardrails de codigo a proposito
+# (fuera de alcance de este fix especifico).
+_ESTADO_PROTEGIDO_RE = re.compile(
+    r"state/\.run_orders\.json|state/\.needs_reconciliation"
+)
+_RM_RE = re.compile(r"\brm\b")
+
+_OPERADORES_ESCRITURA_ESTADO = _OPERADORES_ESCRITURA_ARCHIVO + (_RM_RE,)
+
+# Documentar esta protección (docstrings, PLAYBOOK.md, commits) inevitablemente
+# menciona "rm state/.needs_reconciliation" como PROSA -- una convención común
+# es envolver ese texto entre backticks (formato markdown de código inline).
+# Backtick es ADEMÁS sintaxis real de shell (command substitution): un operador
+# mencionado ASÍ (`rm X`) nunca es una invocación real de la forma en que este
+# hook necesita detectar (una invocación real jamás envuelve el NOMBRE del
+# comando entre backticks). Detectar esto evita el falso positivo sin abrir una
+# vía nueva: una sustitución de comando real detrás de backticks ya es, como el
+# resto de construcciones de shell no evaluadas por este hook (expansión de
+# variables, eval, base64|bash...), un bypass residual aceptado (ver docstring
+# del módulo) -- no una protección que este fix relaje.
+_BACKTICK_SPAN_RE = re.compile(r"`[^`]*`")
+
+
+def _enmascarar_cuerpos_de_heredoc(segmento: str) -> str:
+    """Reemplaza el CONTENIDO (cuerpo) de cada heredoc (<<DELIM ...
+    DELIM) del segmento por espacios, preservando todo lo demas verbatim
+    -- incluida la linea `<<DELIM` de apertura (con el operador y su
+    destino real, si los hay) y el delimitador de cierre. Un heredoc es
+    DATA que el shell redirige a stdin del comando (tipicamente
+    cat/tee escribiendo a state/journal.md, o -- en los propios tests de
+    este hook -- a un archivo de test), nunca texto de COMANDOS nuevos
+    para el resto del segmento. Enmascarar su cuerpo evita que una
+    mencion de un operador (p.ej. "rm") como DATO/prosa DENTRO del
+    cuerpo (un ejemplo de test, una entrada de journal citando esta
+    misma proteccion) se confunda con una invocacion real -- sin afectar
+    la deteccion del operador+destino que aparecen ANTES del marcador
+    `<<` (esa parte no se toca). Residual aceptado, igual que el resto
+    de construcciones de shell no evaluadas por este hook: un heredoc
+    piped a `bash`/`sh` SIN `-c` (que SI ejecutaria su cuerpo como
+    comandos) queda fuera de esta deteccion -- ver docstring del modulo.
+    """
+    resultado = list(segmento)
+    quote = None
+    i = 0
+    n = len(segmento)
+    while i < n:
+        ch = segmento[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if segmento.startswith("<<", i):
+            match = _HEREDOC_START_RE.match(segmento, i)
+            if match:
+                delim = match.group(2)
+                end = match.end()
+                i = end
+                closing_re = re.compile(r"(?m)^[ \t]*" + re.escape(delim) + r"[ \t]*$")
+                closing_match = closing_re.search(segmento, i)
+                body_end = closing_match.start() if closing_match else n
+                for j in range(i, body_end):
+                    resultado[j] = " "
+                i = closing_match.end() if closing_match else n
+                continue
+        i += 1
+    return "".join(resultado)
+
+
+def _region_apunta_a_estado_protegido(segmento: str, desde: int) -> bool:
+    region = _region_objetivo(segmento, desde)
+    return bool(
+        _ESTADO_PROTEGIDO_RE.search(region)
+        or _ESTADO_PROTEGIDO_RE.search(_normalizar(region))
+        or _ESTADO_PROTEGIDO_RE.search(_normalizar_sin_concat(region))
+    )
+
+
+def _escribe_sobre_estado_protegido(segmento: str) -> bool:
+    """Mismo mecanismo que _escribe_sobre_guardrail (operador de escritura
+    -> region objetivo despues de el -> matchea la ruta protegida), pero
+    contra _ESTADO_PROTEGIDO_RE y con `rm` incluido como operador. Un
+    operador cuyo propio NOMBRE cae dentro de un span entre backticks se
+    descarta (prosa/markdown, no invocación real) -- ver comentario de
+    _BACKTICK_SPAN_RE arriba. Un ARGUMENTO citado de una invocación real
+    (p.ej. rm "state/.needs_reconciliation", sin backticks sobre `rm`)
+    sigue detectándose igual: solo se ignora el operador en sí, no la
+    región objetivo que viene después."""
+    base = _enmascarar_cuerpos_de_heredoc(segmento)
+    for variante in (
+        base,
+        _normalizar(base),
+        _normalizar_sin_concat(base),
+    ):
+        backtick_spans = list(_BACKTICK_SPAN_RE.finditer(variante))
+        for operador_re in _OPERADORES_ESCRITURA_ESTADO:
+            for m in operador_re.finditer(variante):
+                if any(s.start() <= m.start() < s.end() for s in backtick_spans):
+                    continue
+                if _region_apunta_a_estado_protegido(variante, m.end()):
+                    return True
+
+    enmascarado = _enmascarar_citas(segmento)
+    for m in _REDIR_RE.finditer(enmascarado):
+        if _region_apunta_a_estado_protegido(segmento, m.end()):
+            return True
+
+    return False
+
+
+# -- Asignacion inline de env vars que evaden presupuesto/aislamiento ------
+# -- de state (WP4/N4a) ------------------------------------------------
+#
+# ETOROAGENT_RUN_ID (presupuesto de ordenes por corrida, WP1) y
+# ETOROAGENT_STATE_DIR (aislamiento de state para tests, WP4/N5) las setea
+# runner.sh por entorno heredado, ANTES de invocar `claude` -- el agente
+# nunca necesita asignarlas inline en un Bash call. Bloquea CUALQUIER
+# asignacion (export o prefijo VAR=valor) de estas variables que aparezca
+# en el mismo comando que una invocacion de uno de los 4 scripts
+# autorizados (place_order/snapshot/candles/reconcile), siempre que
+# ademas haya un vehiculo real de ejecucion (_VEHICULO_RE) -- mismo
+# criterio que _referencia_trading_con_vehiculo, para no bloquear un
+# mensaje de commit en prosa que mencione ambos patrones sin ejecutar
+# nada. A proposito evalua el COMANDO ENTERO, no solo un segmento: un
+# `export ETOROAGENT_RUN_ID=x && ...` encadenado con && (segmentos
+# distintos para el resto de este hook) sigue exportando la variable
+# para el resto del comando en un shell real -- partir por segmento
+# aca dejaria pasar exactamente la variante de evasion mas obvia.
+_ENV_SPOOF_ASSIGN_RE = re.compile(
+    r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR)\s*="
+)
+_ENV_SPOOF_SCRIPT_RE = re.compile(
+    r"scripts/(?:place_order|snapshot|candles|reconcile)\.py\b"
+)
+
+
+def _bloqueado_env_spoof(command: str) -> bool:
+    for variante in (command, _normalizar(command), _normalizar_sin_concat(command)):
+        if (
+            _ENV_SPOOF_ASSIGN_RE.search(variante)
+            and _ENV_SPOOF_SCRIPT_RE.search(variante)
+            and _VEHICULO_RE.search(variante)
+        ):
+            return True
+    return False
+
+
 # -- Orquestacion -------------------------------------------------------
 
 
@@ -606,6 +809,13 @@ def _bloqueado_guardrail(command: str) -> bool:
     return False
 
 
+def _bloqueado_estado_protegido(command: str) -> bool:
+    for segmento in _split_segments(command):
+        if _escribe_sobre_estado_protegido(segmento):
+            return True
+    return False
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -621,6 +831,14 @@ def main() -> int:
     command = tool_input.get("command") or ""
     if not isinstance(command, str):
         return 0
+
+    if _bloqueado_estado_protegido(command):
+        sys.stderr.write(MENSAJE_ESTADO_PROTEGIDO)
+        return 2
+
+    if _bloqueado_env_spoof(command):
+        sys.stderr.write(MENSAJE_ENV_SPOOF)
+        return 2
 
     if _bloqueado_guardrail(command):
         sys.stderr.write(MENSAJE_GUARDRAIL)

@@ -701,3 +701,203 @@ def test_permite_flecha_dentro_de_comillas_en_reason():
         '--amount 10 --stop-loss-pct 0.1 --reason "señal->entrada ver PLAYBOOK.md"'
     )
     assert r.returncode == 0
+
+
+# --- WP4/N3(c): protección de state/.run_orders.json y ---------------------
+# --- state/.needs_reconciliation contra escritura de shell (incluido `rm`) -
+#
+# Re-auditoría: estos dos archivos son de CONTROL (presupuesto de órdenes,
+# flag de reconciliación) -- a diferencia del resto de state/ (positions.json,
+# equity.csv, journal.md), que el agente journalea/lee libremente. Si el
+# agente pudiera `rm state/.needs_reconciliation` por Bash, el protocolo de
+# reconciliación (PLAYBOOK.md) sería honor system puro. A diferencia de los
+# guardrails de código (scripts/, PLAYBOOK.md, etc.), acá `rm` SÍ cuenta
+# como verbo de escritura (es la vía más obvia de evadir el flag).
+
+
+def test_bloquea_rm_sobre_needs_reconciliation():
+    r = run_hook("rm state/.needs_reconciliation")
+    assert r.returncode == 2
+    assert "reconcile.py" in r.stderr
+
+
+def test_bloquea_rm_dash_f_sobre_needs_reconciliation():
+    r = run_hook("rm -f state/.needs_reconciliation")
+    assert r.returncode == 2
+
+
+def test_bloquea_rm_sobre_run_orders_json():
+    r = run_hook("rm state/.run_orders.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_redireccion_sobre_needs_reconciliation():
+    r = run_hook("echo '{}' > state/.needs_reconciliation")
+    assert r.returncode == 2
+
+
+def test_bloquea_tee_sobre_run_orders_json():
+    r = run_hook("echo '{}' | tee state/.run_orders.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_mv_sobre_needs_reconciliation():
+    r = run_hook("mv fake.json state/.needs_reconciliation")
+    assert r.returncode == 2
+
+
+def test_bloquea_escritura_encadenada_tras_orden_legitima_sobre_needs_reconciliation():
+    r = run_hook(
+        ".venv/bin/python scripts/snapshot.py && rm state/.needs_reconciliation"
+    )
+    assert r.returncode == 2
+
+
+def test_permite_reconcile_script_con_done():
+    r = run_hook(".venv/bin/python scripts/reconcile.py --done")
+    assert r.returncode == 0
+
+
+def test_permite_lectura_cat_needs_reconciliation():
+    r = run_hook("cat state/.needs_reconciliation")
+    assert r.returncode == 0
+
+
+def test_permite_lectura_grep_run_orders_json():
+    r = run_hook("grep count state/.run_orders.json")
+    assert r.returncode == 0
+
+
+def test_permite_journal_normal_no_bloquea_por_mencion_de_estado_protegido():
+    # Journalear (tee -a a journal.md) mencionando estos archivos como TEXTO
+    # (no como destino) sigue permitido -- el destino real es journal.md.
+    r = run_hook(
+        "tee -a state/journal.md <<'EOF'\n"
+        "- 2026-08-12 20:20 -0300 RECONCILIACION | sin discrepancias vs state/.needs_reconciliation\n"
+        "EOF"
+    )
+    assert r.returncode == 0
+
+
+# --- WP4/N4(a): asignación inline de ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR -
+#
+# Re-auditoría: el presupuesto de órdenes por corrida (WP1) y el
+# aislamiento de state para tests (WP4/N5) confían en que
+# ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR las setea runner.sh por entorno
+# heredado -- el agente nunca necesita asignarlas inline. Si pudiera,
+# "ETOROAGENT_RUN_ID=fresh .venv/bin/python scripts/place_order.py open..."
+# resetearía el presupuesto de la corrida a voluntad.
+
+
+def test_bloquea_run_id_inline_prefijo_con_place_order():
+    r = run_hook(
+        "ETOROAGENT_RUN_ID=fake-run .venv/bin/python scripts/place_order.py "
+        "open --symbol SPY --amount 10 --stop-loss-pct 0.1"
+    )
+    assert r.returncode == 2
+    assert "ETOROAGENT_RUN_ID" in r.stderr
+
+
+def test_bloquea_export_run_id_encadenado_con_place_order():
+    r = run_hook(
+        "export ETOROAGENT_RUN_ID=fake-run && .venv/bin/python "
+        "scripts/place_order.py open --symbol SPY --amount 10 --stop-loss-pct 0.1"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_state_dir_inline_con_snapshot():
+    r = run_hook(
+        "ETOROAGENT_STATE_DIR=/tmp/fake .venv/bin/python scripts/snapshot.py"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_run_id_inline_con_reconcile():
+    r = run_hook(
+        "ETOROAGENT_RUN_ID=fake .venv/bin/python scripts/reconcile.py --done"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_run_id_inline_con_candles():
+    r = run_hook(
+        "ETOROAGENT_RUN_ID=fake .venv/bin/python scripts/candles.py --symbol SPY --count 10"
+    )
+    assert r.returncode == 2
+
+
+def test_permite_asignacion_de_run_id_sin_script_autorizado():
+    # Asignar la variable sin invocar ninguno de los 4 scripts no es el
+    # patrón de evasión -- no hay nada que evadir.
+    r = run_hook("ETOROAGENT_RUN_ID=fake echo hola")
+    assert r.returncode == 0
+
+
+def test_permite_mencion_de_run_id_sin_asignacion():
+    # Sin "=" no es una asignación -- p.ej. imprimir la variable actual.
+    r = run_hook("echo \"corriendo con ETOROAGENT_RUN_ID $ETOROAGENT_RUN_ID\"")
+    assert r.returncode == 0
+
+
+def test_permite_mencion_en_commit_message_sin_vehiculo():
+    # Mencionar ambos patrones en un mensaje de commit (prosa, sin invocar
+    # python realmente) no debe bloquear -- mismo criterio que ya aplica el
+    # hook para endpoints de trading en mensajes de commit.
+    r = run_hook(
+        'git commit -m "fix: bloquear ETOROAGENT_RUN_ID= inline junto a '
+        'scripts/place_order.py en risk_hook.py"'
+    )
+    assert r.returncode == 0
+
+
+def test_permite_pytest_con_etoroagent_run_id_en_nombre_de_test():
+    r = run_hook(".venv/bin/pytest tests/test_place_order.py -k ETOROAGENT_RUN_ID")
+    assert r.returncode == 0
+
+
+def test_permite_mencion_de_rm_entre_backticks_en_prosa_de_commit():
+    # Regresión real: encontrada al commitear este mismo cambio. Documentar
+    # la protección en un mensaje de commit inevitablemente menciona
+    # "rm state/.needs_reconciliation" como prosa -- envuelto entre
+    # backticks (convención markdown), no debe bloquear.
+    r = run_hook(
+        "git commit -m \"antes nada impedia \\`rm state/.needs_reconciliation\\` "
+        "sin haber reconciliado nada\""
+    )
+    assert r.returncode == 0
+
+
+def test_permite_mencion_de_rm_sin_backticks_dentro_de_heredoc():
+    # Regresión real (2): un heredoc que escribe a un archivo NO protegido
+    # (p.ej. este mismo archivo de tests) puede tener, como DATO/texto
+    # literal, una línea que menciona "rm state/.needs_reconciliation" sin
+    # backticks -- el cuerpo del heredoc es DATA, no comandos nuevos.
+    r = run_hook(
+        "cat >> tests/some_file.py << 'EOF'\n"
+        'r = run_hook("rm state/.needs_reconciliation")\n'
+        "EOF"
+    )
+    assert r.returncode == 0
+
+
+def test_bloquea_rm_sin_backticks_sigue_bloqueando_tras_el_fix_de_prosa():
+    # Control positivo: el fix de prosa no debe relajar la detección real.
+    r = run_hook("rm state/.needs_reconciliation")
+    assert r.returncode == 2
+
+
+def test_bloquea_rm_con_argumento_citado_sin_backticks_sobre_rm():
+    # El operador "rm" en sí NO está entre backticks acá -- solo su
+    # argumento está citado (comillas normales, invocación real). Debe
+    # seguir bloqueando: el fix de prosa solo descarta el operador cuando
+    # el propio NOMBRE del comando cae dentro de backticks.
+    r = run_hook('rm "state/.needs_reconciliation"')
+    assert r.returncode == 2
+
+
+def test_bloquea_tee_heredoc_sobre_needs_reconciliation_target_antes_del_heredoc():
+    # Control: el enmascarado del CUERPO del heredoc no debe afectar la
+    # detección del operador+destino que aparecen ANTES del marcador `<<`.
+    r = run_hook("tee state/.needs_reconciliation <<'EOF'\nevil\nEOF")
+    assert r.returncode == 2
