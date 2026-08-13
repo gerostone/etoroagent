@@ -1146,6 +1146,17 @@ def test_permite_python_json_tool_positions_json():
     assert r.returncode == 0
 
 
+def test_permite_venv_python_json_tool():
+    # FP reportado por el auditor: el python del venv tiene prefijo de ruta.
+    r = run_hook(".venv/bin/python -m json.tool state/positions.json")
+    assert r.returncode == 0
+
+
+def test_bloquea_venv_json_tool_con_pipe_a_vehiculo():
+    r = run_hook(".venv/bin/python -m json.tool state/positions.json | bash")
+    assert r.returncode == 2
+
+
 def test_permite_tail_equity_csv():
     r = run_hook("tail state/equity.csv")
     assert r.returncode == 0

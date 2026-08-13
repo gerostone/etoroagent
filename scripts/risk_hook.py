@@ -715,7 +715,7 @@ _MENCION_ESTADO_PROTEGIDO_RE = re.compile(
 # detectando.
 _LECTURA_SEGURA_ESTADO_INICIO_RE = re.compile(
     r"^(?:cat|head|tail|less|more|wc|ls|stat|grep|diff)\s"
-    r"|^python3?\s+-m\s+json\.tool\s"
+    r"|^(?:\S*/)?python3?\s+-m\s+json\.tool\s"
 )
 _OPERADOR_ADICIONAL_RE = re.compile(r"[|&;<>`$]")
 
