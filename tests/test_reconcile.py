@@ -181,3 +181,64 @@ def test_done_usa_la_entrada_reconciliacion_mas_reciente(tmp_path):
 
     assert rc == 0
     assert not (state_dir / ".needs_reconciliation").exists()
+
+
+# -- WP5/N5b: ETOROAGENT_STATE_DIR redirige state/ cuando no hay kwarg ------
+#
+# place_order.py y snapshot.py ya honran ETOROAGENT_STATE_DIR (WP4/N5)
+# cuando el caller no pasa el kwarg state_dir= explícito -- pensado para
+# harnesses de test/auditoría que invocan el script real por subprocess
+# (no pueden pasar kwargs de Python). reconcile.py se había quedado atrás:
+# siempre usaba el STATE_DIR real del repo sin el kwarg, sin importar la
+# env var. La protección contra que el AGENTE la use para evadir la
+# reconciliación sigue siendo scripts/risk_hook.py (WP4/N4a), no este
+# fallback.
+
+
+def test_state_dir_por_env_cuando_kwarg_ausente(tmp_path, monkeypatch):
+    env_state_dir = tmp_path / "env_state"
+    _write_flag(env_state_dir, "2026-08-12 20:15 -0300")
+    (env_state_dir / "journal.md").write_text(
+        _journal_line("2026-08-12 20:15 -0300", "ABORTADA", "corrida abortada")
+        + _journal_line("2026-08-12 20:20 -0300", "RECONCILIACION", "sin discrepancias")
+    )
+    monkeypatch.setenv("ETOROAGENT_STATE_DIR", str(env_state_dir))
+
+    # Sin pasar state_dir= -- debe resolver vía ETOROAGENT_STATE_DIR, no el
+    # STATE_DIR real del repo.
+    rc = reconcile.main(["--done"])
+
+    assert rc == 0
+    assert not (env_state_dir / ".needs_reconciliation").exists()
+
+
+def test_state_dir_kwarg_explicito_tiene_prioridad_sobre_env(tmp_path, monkeypatch):
+    kwarg_dir = tmp_path / "a" / "state"
+    other_dir = tmp_path / "b" / "state"
+    _write_flag(kwarg_dir, "2026-08-12 20:15 -0300")
+    (kwarg_dir / "journal.md").write_text(
+        _journal_line("2026-08-12 20:15 -0300", "ABORTADA", "corrida abortada")
+        + _journal_line("2026-08-12 20:20 -0300", "RECONCILIACION", "sin discrepancias")
+    )
+    monkeypatch.setenv("ETOROAGENT_STATE_DIR", str(other_dir))
+
+    rc = reconcile.main(["--done"], state_dir=kwarg_dir)
+
+    assert rc == 0
+    assert not (kwarg_dir / ".needs_reconciliation").exists()
+    assert not other_dir.exists()
+
+
+def test_sin_env_ni_kwarg_usa_state_dir_default_del_modulo(tmp_path, monkeypatch):
+    # Sin ETOROAGENT_STATE_DIR seteada y sin kwarg -- debe caer al
+    # STATE_DIR real del módulo (reconcile.STATE_DIR), no a otra ruta.
+    # Monkeypatcheamos STATE_DIR a un tmp_path para no depender del
+    # filesystem real ni ensuciar el state/ real del repo.
+    monkeypatch.delenv("ETOROAGENT_STATE_DIR", raising=False)
+    fallback_dir = tmp_path / "fallback_state"
+    fallback_dir.mkdir(parents=True)
+    monkeypatch.setattr(reconcile, "STATE_DIR", fallback_dir)
+
+    rc = reconcile.main(["--done"])
+
+    assert rc == 0  # sin flag en fallback_dir -- idempotente, nada que hacer

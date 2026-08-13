@@ -36,9 +36,23 @@ place_order.py no cambia: sigue bloqueando aperturas mientras el flag
 exista, sin importar cómo se haya borrado -- este script es simplemente la
 única vía recomendada (y, tras N3c, la única practicable por Bash) para
 borrarlo con la verificación de por medio.
+
+WP5/N5b (re-auditoría): a diferencia de place_order.py y snapshot.py (que
+honran ETOROAGENT_STATE_DIR desde WP4/N5), este script todavía usaba
+siempre el STATE_DIR real del repo cuando no se pasaba el kwarg state_dir=
+explícito -- un harness de test/auditoría que invocara `reconcile.py
+--done` real por subprocess (sin poder pasar kwargs de Python) no podía
+aislar su state, a diferencia de los otros tres scripts autorizados.
+main() ahora sigue el mismo criterio: sin kwarg explícito, cae a
+ETOROAGENT_STATE_DIR si está seteada, antes de STATE_DIR. Igual que en
+esos otros scripts, la protección contra que el AGENTE la use para evadir
+la reconciliación NO es este fallback -- es scripts/risk_hook.py (WP4/N4a),
+que bloquea asignar ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR inline junto a
+una invocación de cualquiera de los 4 scripts autorizados.
 """
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -163,7 +177,11 @@ def main(argv=None, state_dir: Path = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if state_dir is None:
-        state_dir = STATE_DIR
+        # WP5/N5b: sin kwarg explícito, honra ETOROAGENT_STATE_DIR antes de
+        # caer al STATE_DIR real del repo -- mismo criterio que
+        # place_order.py y snapshot.py (WP4/N5), para harnesses de
+        # test/auditoría que invocan este script real por subprocess.
+        state_dir = os.environ.get("ETOROAGENT_STATE_DIR") or STATE_DIR
     state_dir = Path(state_dir)
 
     _build_parser().parse_args(argv)  # solo soporta --done por ahora
