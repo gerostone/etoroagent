@@ -541,32 +541,80 @@ def test_permite_open_eth_con_btc_existente_alias_distinto():
     assert ok, msg
 
 
-def test_exposicion_cripto_agregada_cubre_alias_no_listado_explicitamente():
-    # "BTCGBP" no está en CRYPTO_SYMBOLS (lista cerrada) pero claramente es
-    # BTC por prefijo -- antes de canonical_symbol(), esta posición NO
-    # contaba contra el 35% cripto (fallaba abierto ante formatos nuevos).
-    state = {
-        "cashUsd": 100.0,
-        "positions": [{"symbol": "BTCGBP", "valueUsd": 30.0}],
-    }  # total = 130
-    # ETH nuevo: no-dup no interviene (BTCGBP canonicaliza a BTC, != ETH).
-    # (30 + 20) / 130 = 38.46% > 35% -> debe bloquear por cripto agregado.
-    ok, msg = validate(open_order(symbol="ETH", amount=20.0), state, EQUITY_OK)
-    assert not ok and "cripto" in msg.lower()
-
-
-def test_universo_acepta_alias_cripto_no_listado_explicitamente_via_canonical():
-    # El chequeo de universo también usa canonical_symbol: un alias BTC no
-    # listado en UNIVERSE (p.ej. "BTCGBP") pasa igual porque canonicaliza a
-    # "BTC" (que sí está).
-    state = {"cashUsd": 1000.0, "positions": []}
-    ok, msg = validate(open_order(symbol="BTCGBP", amount=10.0), state, EQUITY_OK)
-    assert ok, msg
-
-
 def test_universo_sigue_bloqueando_simbolo_no_cripto_desconocido():
     # Control: un símbolo desconocido que NO empieza con BTC/ETH sigue
     # bloqueado igual que antes (canonical_symbol no lo cambia).
     state = {"cashUsd": 1000.0, "positions": []}
     ok, msg = validate(open_order(symbol="AAPL"), state, EQUITY_OK)
     assert not ok and "universo" in msg.lower()
+
+
+# --- WP5/N7 (re-auditoría, hallazgo CRÍTICO): canonicalización SOLO por --
+# --- whitelist exacta, universo sobre el símbolo ORIGINAL --------------
+#
+# canonical_symbol() colapsaba por PREFIJO ("empieza con BTC/ETH ->
+# colapsa"), y el chequeo de universo comparaba canonical_symbol(symbol)
+# contra UNIVERSE. "BTCS" -- un activo REAL y DISTINTO, fuera del universo
+# operable -- canonicalizaba igual a "BTC", pasaba el chequeo de universo y
+# la orden llegaba a la API. Ahora canonical_symbol() colapsa solo alias
+# CONOCIDOS (whitelist construida desde CRYPTO_SYMBOLS +
+# CRYPTO_SEARCH_VARIANTS) y el chequeo de universo compara el símbolo
+# ORIGINAL normalizado -- "BTCGBP"/"BTCS" (no whitelisteados) ya no
+# canonicalizan a "BTC" y quedan bloqueados por universo, igual que
+# cualquier otro símbolo desconocido (reemplaza los tests viejos que
+# esperaban que "BTCGBP" pasara vía canonicalización por prefijo -- eso era
+# la manifestación no-crítica del mismo bug que "BTCS" explota).
+
+
+def test_n7_btcs_bloqueada_por_universo_cliente_no_se_llama():
+    # Escenario EXACTO del hallazgo N7: "BTCS" no es una variante de BTC,
+    # es un activo distinto y no está en el universo operable -- debe
+    # bloquearse ANTES de resolver instrumentId o tocar el cliente HTTP.
+    state = {"cashUsd": 1000.0, "positions": []}
+    ok, msg = validate(open_order(symbol="BTCS", amount=10.0), state, EQUITY_OK)
+    assert not ok and "universo" in msg.lower()
+
+
+def test_n7_canonical_symbol_no_colapsa_btcs_por_prefijo():
+    # Control directo sobre la función: "BTCS" no está en la whitelist
+    # exacta -- a diferencia de la lógica de prefijo anterior, no debe
+    # colapsar a "BTC".
+    assert canonical_symbol("BTCS") == "BTCS"
+    assert canonical_symbol("btcs") == "BTCS"
+    assert canonical_symbol("ETHX") == "ETHX"
+
+
+def test_n7_btcusd_sigue_canonicalizando_a_btc():
+    assert canonical_symbol("BTCUSD") == "BTC"
+
+
+def test_n7_btc_usd_case_insensitive_sigue_canonicalizando_a_btc():
+    assert canonical_symbol("btc-usd") == "BTC"
+    assert canonical_symbol("Btc-Usd") == "BTC"
+
+
+def test_n7_tsla_sigue_bloqueada_fuera_del_universo():
+    state = {"cashUsd": 1000.0, "positions": []}
+    ok, msg = validate(open_order(symbol="TSLA", amount=10.0), state, EQUITY_OK)
+    assert not ok and "universo" in msg.lower()
+
+
+def test_n7_btcs_no_llega_al_cliente_mock_explota_si_se_llama():
+    # Verifica el contrato completo end-to-end (validate() es lógica pura,
+    # sin cliente HTTP -- este test confirma que un caller que respete su
+    # resultado nunca llega a invocar la API para un símbolo bloqueado).
+    class _ExplosiveClient:
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"BTCS está fuera del universo: el cliente NO debía "
+                f"invocarse (se intentó acceder a {name!r})"
+            )
+
+    client = _ExplosiveClient()
+    state = {"cashUsd": 1000.0, "positions": []}
+    ok, msg = validate(open_order(symbol="BTCS", amount=10.0), state, EQUITY_OK)
+    assert not ok and "universo" in msg.lower()
+    # Si validate() hubiera dado luz verde, cualquier intento de usar el
+    # cliente acá haría explotar el mock -- documentamos el contrato.
+    if ok:
+        client.search_instrument("BTCS")

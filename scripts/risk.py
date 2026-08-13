@@ -18,13 +18,25 @@ Límites (spec §6, perfil Moderado) — NO negociables por el agente:
   WP4 (re-auditoría): la no-duplicación original comparaba símbolo por
   IGUALDAD DE STRING -- un alias distinto del mismo activo cripto (BTC en
   cartera, open BTCUSD/BTC-USD/BTCEUR/btcusd) se veía como "otro símbolo"
-  y pasaba. canonical_symbol() colapsa cualquier variante con prefijo
-  BTC/ETH a un único canónico; se usa en no-duplicación, en la suma de
-  exposición cripto agregada, y en el chequeo de universo, para que los
-  tres vean el MISMO activo sin importar el alias pedido (N2). Además, el
-  filtro "valueUsd>0" de la no-duplicación original dejaba reabrir un
-  símbolo cuya posición existente estaba en 0 o negativo -- ahora es la
-  PRESENCIA del símbolo la que bloquea, cualquier valueUsd finito (N6).
+  y pasaba. canonical_symbol() colapsa un alias cripto CONOCIDO a un único
+  canónico; se usa en no-duplicación y en la suma de exposición cripto
+  agregada, para que ambas vean el MISMO activo sin importar el alias
+  pedido (N2). Además, el filtro "valueUsd>0" de la no-duplicación
+  original dejaba reabrir un símbolo cuya posición existente estaba en 0 o
+  negativo -- ahora es la PRESENCIA del símbolo la que bloquea, cualquier
+  valueUsd finito (N6).
+
+  WP5/N7 (re-auditoría, hallazgo CRÍTICO): canonical_symbol() colapsaba
+  por PREFIJO ("empieza con BTC/ETH tras normalizar -> colapsa"), y el
+  chequeo de universo comparaba canonical_symbol(symbol) contra UNIVERSE.
+  Un activo REAL y DISTINTO fuera del universo operable cuyo ticker
+  empezara con "BTC" (p.ej. "BTCS") canonicalizaba igual a "BTC", pasaba
+  el chequeo de universo, y la orden llegaba a la API. Ahora
+  canonical_symbol() colapsa SOLO por whitelist exacta (mapa construido
+  desde CRYPTO_SYMBOLS + CRYPTO_SEARCH_VARIANTS, no por coincidencia de
+  prefijo) y el chequeo de universo compara el símbolo ORIGINAL
+  normalizado contra UNIVERSE -- la canonicalización se aplica DESPUÉS,
+  solo para no-duplicación y para la suma de exposición cripto agregada.
 
 validate() es fail-closed: ante action="open" con state o equity_rows
 incompletos, malformados o con valores no numéricos/no finitos, bloquea la
@@ -110,28 +122,42 @@ def _norm_symbol(raw) -> str:
     return str(raw).strip().upper()
 
 
+# WP5/N7 (re-auditoría, hallazgo CRÍTICO): whitelist EXACTA de alias ->
+# canónico, construida una sola vez a partir de CRYPTO_SYMBOLS (variantes
+# de POSICIÓN ya resueltas: BTCUSD, BTC-USD, BTCEUR, ...) y de
+# CRYPTO_SEARCH_VARIANTS (variantes de BÚSQUEDA: BTCUSD, BTC-USD para BTC;
+# ETHUSD, ETH-USD para ETH). Deliberadamente NO es "empieza con BTC/ETH ->
+# colapsa" (esa era la lógica de prefijo que dejaba pasar "BTCS" -- un
+# activo real y distinto, fuera del universo -- como si fuera "BTC"): un
+# alias que no está en este mapa NO canonicaliza a nada, pasa sin cambios.
+_CRYPTO_ALIAS_TO_CANONICAL = {}
+for _crypto_symbol in CRYPTO_SYMBOLS:
+    if _crypto_symbol.startswith("BTC"):
+        _CRYPTO_ALIAS_TO_CANONICAL[_crypto_symbol] = "BTC"
+    elif _crypto_symbol.startswith("ETH"):
+        _CRYPTO_ALIAS_TO_CANONICAL[_crypto_symbol] = "ETH"
+for _canonical_symbol, _search_variants in CRYPTO_SEARCH_VARIANTS.items():
+    for _variant in _search_variants:
+        _CRYPTO_ALIAS_TO_CANONICAL[_variant.upper()] = _canonical_symbol
+del _crypto_symbol, _canonical_symbol, _search_variants, _variant
+
+
 def canonical_symbol(raw) -> str:
-    """WP4/N2: normaliza (strip+upper, vía _norm_symbol) y además COLAPSA
-    cualquier alias de símbolo cripto a un canónico único ("BTC"/"ETH"),
-    para que no-duplicación, exposición cripto agregada y el chequeo de
-    universo no puedan evadirse abriendo el MISMO activo bajo un alias de
-    símbolo distinto (BTCUSD, BTC-USD, BTCEUR, btcusd, ...).
+    """WP4/N2, corregido por WP5/N7: normaliza (strip+upper, vía
+    _norm_symbol) y colapsa un alias cripto CONOCIDO -- presente en la
+    whitelist exacta _CRYPTO_ALIAS_TO_CANONICAL -- a su canónico único
+    ("BTC"/"ETH"). Un símbolo que no está en esa whitelist (incluido
+    cualquiera que simplemente EMPIECE con "BTC"/"ETH" sin ser una
+    variante conocida, p.ej. "BTCS") pasa SIN cambios, ya normalizado: ya
+    NO decide qué es o no es cripto, solo colapsa alias YA CONOCIDOS.
 
-    Deliberadamente NO es un mapeo explícito 1:1 contra CRYPTO_SYMBOLS/
-    CRYPTO_SEARCH_VARIANTS: es "empieza con BTC/ETH tras normalizar ->
-    colapsa", así que también cubre variantes de formato FUTURAS que eToro
-    pueda exponer y que hoy no estén listadas explícitamente en ningún
-    set (mismo espíritu que el comentario sobre CRYPTO_SYMBOLS más abajo:
-    una lista cerrada de variantes falla abierto ante un formato nuevo).
-
-    Símbolos no-cripto (ninguno del universo de equities empieza con BTC/
-    ETH) pasan sin cambios, ya normalizados."""
+    El chequeo de universo en validate() compara el símbolo ORIGINAL
+    normalizado contra UNIVERSE, nunca su canónico -- esta función se usa
+    DESPUÉS de ese chequeo, únicamente para no-duplicación y para sumar
+    exposición cripto agregada (ver validate() y su docstring de módulo,
+    WP5/N7)."""
     symbol = _norm_symbol(raw)
-    if symbol.startswith("BTC"):
-        return "BTC"
-    if symbol.startswith("ETH"):
-        return "ETH"
-    return symbol
+    return _CRYPTO_ALIAS_TO_CANONICAL.get(symbol, symbol)
 
 
 def _normalize_state(state: dict) -> tuple[float, list]:
@@ -239,11 +265,18 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
     if not symbol:
         return False, "Símbolo de orden inválido."
 
-    # WP4/N2: canonical_symbol() para que un alias cripto no listado
-    # explícitamente en UNIVERSE (p.ej. una variante de formato nueva de
-    # eToro) siga reconociéndose como BTC/ETH en vez de bloquearse por un
-    # tecnicismo de formato -- ver docstring del módulo y de la función.
-    if canonical_symbol(symbol) not in UNIVERSE:
+    # WP5/N7 (re-auditoría, hallazgo CRÍTICO): el chequeo de universo va
+    # sobre el símbolo ORIGINAL normalizado, NUNCA sobre canonical_symbol()
+    # -- antes, canonical_symbol(symbol) colapsaba por PREFIJO ("BTCS" ->
+    # "BTC"), y "BTC" SÍ está en UNIVERSE, así que un activo real y
+    # DISTINTO ("BTCS"), fuera del universo operable, pasaba este chequeo
+    # y la orden llegaba a la API. UNIVERSE ya contiene, literal, todas
+    # las variantes de formato cripto CONOCIDAS (CRYPTO_SYMBOLS: BTCUSD,
+    # BTC-USD, BTCEUR, ...) -- no hace falta canonicalizar para
+    # reconocerlas acá. canonical_symbol() se sigue usando más abajo, pero
+    # solo para no-duplicación y para sumar exposición cripto agregada --
+    # nunca para decidir si un símbolo es operable.
+    if symbol not in UNIVERSE:
         return False, (
             f"Símbolo {symbol} fuera del universo operable — actualizar "
             "mapeo/universo antes de continuar."
