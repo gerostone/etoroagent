@@ -1061,13 +1061,22 @@ def test_run_id_nuevo_resetea_presupuesto_de_corrida(tmp_path, monkeypatch):
 
 def test_septima_orden_del_dia_bloquea(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
-    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
     state_dir = _big_state_dir(tmp_path)
 
-    for i, symbol in enumerate(_BUDGET_SYMBOLS[:6]):
+    # 6 aperturas repartidas en 2 "corridas" (run ids distintos, 3 cada
+    # una) para no chocar con el tope POR CORRIDA (WP1/N4b) al ejercitar
+    # el tope DIARIO global -- MAX_ORDERS_PER_DAY=6 aplica sin importar
+    # cuántas corridas (o invocaciones manuales) distintas lo alcanzaron.
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-1")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
         rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
         assert rc == 0
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-2")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[3:6]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i + 3)
+        assert rc == 0
 
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-3")
     client7 = MagicMock()
     rc7 = place_order.main(
         ["open", "--symbol", _BUDGET_SYMBOLS[6], "--amount", "10", "--stop-loss-pct", "0.10"],
@@ -1081,18 +1090,76 @@ def test_septima_orden_del_dia_bloquea(tmp_path, monkeypatch):
     assert "presupuesto diario" in journal
 
 
-def test_sin_run_id_solo_aplica_el_limite_diario(tmp_path, monkeypatch):
-    # Sin ETOROAGENT_RUN_ID (invocación manual): el tope de 3 por corrida NO
-    # se aplica -- una 4ta orden manual sigue pasando (solo el diario, de 6,
-    # podría eventualmente bloquear).
+# -- WP4/N4(b): invocación manual (sin ETOROAGENT_RUN_ID) usa un run_id ------
+# -- sintético "manual-YYYY-MM-DD" -------------------------------------------
+#
+# Re-auditoría: rotar/desetear ETOROAGENT_RUN_ID evadía el tope por
+# corrida. Antes de N4(b), "sin ETOROAGENT_RUN_ID" solo tenía el tope
+# diario global (6) como freno -- hasta 6 aperturas manuales seguidas sin
+# ningún throttle intermedio. Con el run_id sintético, una invocación
+# manual queda acotada a MAX_ORDERS_PER_RUN (3) por día, igual que una
+# corrida real -- ADEMÁS del tope diario global, que sigue aplicando.
+
+
+def test_manual_sin_run_id_topea_en_3_por_dia_ademas_del_diario_global(tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "0")
     monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
     state_dir = _big_state_dir(tmp_path)
 
-    for i, symbol in enumerate(_BUDGET_SYMBOLS[:4]):
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
         rc, client = _open_ok(state_dir, symbol, instrument_id=i)
         assert rc == 0
         client.open_position_by_amount.assert_called_once()
+
+    # 4ta apertura manual el MISMO día -- bloqueada por el tope "por
+    # corrida" del run_id sintético, aunque el diario global (6) todavía
+    # tenga margen.
+    client4 = MagicMock()
+    rc4 = place_order.main(
+        ["open", "--symbol", _BUDGET_SYMBOLS[3], "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client4,
+    )
+    assert rc4 == 2
+    client4.search_instrument.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "tope de 3 órdenes por corrida" in journal
+
+
+def test_manual_run_id_sintetico_resetea_al_dia_siguiente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    state_dir = _big_state_dir(tmp_path)
+
+    monkeypatch.setattr(place_order, "_today_local", lambda: "2026-08-12")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    # Día siguiente: el run_id sintético cambia ("manual-2026-08-13"),
+    # mismo mecanismo de reset que un ETOROAGENT_RUN_ID real nuevo.
+    monkeypatch.setattr(place_order, "_today_local", lambda: "2026-08-13")
+    rc, client = _open_ok(state_dir, _BUDGET_SYMBOLS[3], instrument_id=3)
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+def test_manual_y_run_id_real_no_comparten_contador_de_corrida(tmp_path, monkeypatch):
+    # Una corrida real (ETOROAGENT_RUN_ID seteada) y una invocación manual
+    # el mismo día son run_ids DISTINTOS ("run-real" vs
+    # "manual-<hoy>") -- cada una tiene su propio tope de 3, no se pisan.
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = _big_state_dir(tmp_path)
+
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-real")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    rc, client = _open_ok(state_dir, _BUDGET_SYMBOLS[3], instrument_id=3)
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
 
 
 def test_bloqueo_por_riesgo_no_consume_presupuesto(tmp_path, monkeypatch):
@@ -1476,3 +1543,63 @@ def test_presupuesto_ausente_no_es_corrupcion_primera_orden_pasa(tmp_path, monke
     rc, client = _open_ok(state_dir, "SPY", instrument_id=1)
     assert rc == 0
     client.open_position_by_amount.assert_called_once()
+
+
+# -- WP4/N5: ETOROAGENT_STATE_DIR redirige state/ cuando no hay kwarg -------
+#
+# Pensado para harnesses de test/auditoría que invocan el script real por
+# subprocess (no pueden pasar el kwarg state_dir= de Python). La
+# protección contra que el AGENTE la use para evadir presupuesto/
+# reconciliación es el hook (N4a), no este fallback.
+
+
+def test_state_dir_por_env_cuando_kwarg_ausente(tmp_path, monkeypatch):
+    # DRY_RUN por default (no seteado, fail-safe): no hace falta un client
+    # mockeado, y no toca el state/ real del repo -- ETOROAGENT_STATE_DIR
+    # debe resolverse igual sin el kwarg state_dir=.
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    env_state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    monkeypatch.setenv("ETOROAGENT_STATE_DIR", str(env_state_dir))
+
+    # Sin pasar state_dir= -- debe resolver vía ETOROAGENT_STATE_DIR, no el
+    # STATE_DIR real del repo.
+    rc = place_order.main(["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"])
+
+    assert rc == 0
+    journal = (env_state_dir / "journal.md").read_text()
+    assert "DRY_RUN" in journal
+
+
+def test_state_dir_kwarg_explicito_tiene_prioridad_sobre_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    kwarg_dir = write_state(tmp_path / "a", STATE_BASIC, EQUITY_ROWS_BASIC)
+    other_dir = tmp_path / "b" / "state"
+    monkeypatch.setenv("ETOROAGENT_STATE_DIR", str(other_dir))
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=kwarg_dir,
+    )
+
+    assert rc == 0
+    assert (kwarg_dir / "journal.md").exists()
+    assert not other_dir.exists()
+
+
+def test_sin_env_ni_kwarg_usa_state_dir_default_del_modulo(tmp_path, monkeypatch):
+    # Sin ETOROAGENT_STATE_DIR seteada y sin kwarg -- debe caer al
+    # STATE_DIR real del módulo (place_order.STATE_DIR), no a otra ruta.
+    # Monkeypatcheamos STATE_DIR a un tmp_path para no depender del
+    # filesystem real ni ensuciar el state/ real del repo.
+    monkeypatch.delenv("ETOROAGENT_STATE_DIR", raising=False)
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    fallback_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    monkeypatch.setattr(place_order, "STATE_DIR", fallback_dir)
+
+    rc = place_order.main(["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"])
+
+    assert rc == 0
+    assert (fallback_dir / "journal.md").exists()

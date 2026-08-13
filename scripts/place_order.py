@@ -253,6 +253,24 @@ def _today_local() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
+def _effective_run_id() -> str:
+    """WP4/N4(b) (re-auditoría): sin ETOROAGENT_RUN_ID (invocación
+    manual), se usa un run_id SINTÉTICO "manual-YYYY-MM-DD" en vez de
+    None -- así las invocaciones manuales también quedan acotadas a
+    MAX_ORDERS_PER_RUN por día, además del tope diario global (que ya
+    aplicaba). Antes de este fix, "sin ETOROAGENT_RUN_ID" solo tenía el
+    tope diario global (6) como freno -- hasta 6 aperturas manuales
+    seguidas sin ningún throttle intermedio, y rotar/desetear
+    ETOROAGENT_RUN_ID evadía el tope por corrida por completo. Con esto,
+    tanto una corrida real (runner.sh) como una sesión manual quedan
+    limitadas a MAX_ORDERS_PER_RUN aperturas antes de necesitar un
+    run_id nuevo (corrida real) o un día nuevo (invocación manual)."""
+    run_id = os.environ.get("ETOROAGENT_RUN_ID")
+    if run_id:
+        return run_id
+    return f"manual-{_today_local()}"
+
+
 class _OrderBudgetCorruptError(Exception):
     """WP4/N3(a) (re-auditoría): state/.run_orders.json EXISTE pero es
     ilegible/corrupto (JSON inválido, no es un objeto, o count/dailyCount
@@ -330,7 +348,7 @@ def _check_order_budget(state_dir: Path) -> str:
     el diario, o el archivo mismo (WP4/N3a: corrupto/ilegible ->
     fail-closed) está agotado/inválido, o "" si hay presupuesto
     disponible."""
-    run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
+    run_id = _effective_run_id()
     try:
         budget = _normalize_order_budget(
             _load_order_budget(state_dir), run_id, _today_local()
@@ -341,7 +359,7 @@ def _check_order_budget(state_dir: Path) -> str:
             f"borr\u00e1 {ORDER_BUDGET_FILE} ({exc})"
         )
 
-    if run_id is not None and budget["count"] >= MAX_ORDERS_PER_RUN:
+    if budget["count"] >= MAX_ORDERS_PER_RUN:
         return f"tope de {MAX_ORDERS_PER_RUN} órdenes por corrida alcanzado"
     if budget["dailyCount"] >= MAX_ORDERS_PER_DAY:
         return f"presupuesto diario de {MAX_ORDERS_PER_DAY} órdenes agotado"
@@ -359,15 +377,14 @@ def _consume_order_budget(state_dir: Path) -> None:
     el registro de una orden que YA se envió -- arrancamos de un
     presupuesto fresco en vez de propagar la excepción después del hecho
     (la orden ya fue journaleada por el caller antes de esta llamada)."""
-    run_id = os.environ.get("ETOROAGENT_RUN_ID") or None
+    run_id = _effective_run_id()
     today = _today_local()
     try:
         loaded = _load_order_budget(state_dir)
     except _OrderBudgetCorruptError:
         loaded = {"runId": None, "count": 0, "date": None, "dailyCount": 0}
     budget = _normalize_order_budget(loaded, run_id, today)
-    if run_id is not None:
-        budget["count"] = budget["count"] + 1
+    budget["count"] = budget["count"] + 1
     budget["dailyCount"] = budget["dailyCount"] + 1
     _save_order_budget(state_dir, budget)
 
@@ -779,7 +796,13 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if state_dir is None:
-        state_dir = STATE_DIR
+        # WP4/N5: sin kwarg explícito, honra ETOROAGENT_STATE_DIR antes de
+        # caer al STATE_DIR real del repo -- pensado para harnesses de
+        # test/auditoría que invocan este script real por subprocess (no
+        # pueden pasar el kwarg de Python). La protección contra que el
+        # AGENTE la use para evadir presupuesto/reconciliación es
+        # scripts/risk_hook.py (WP4/N4a), no este fallback.
+        state_dir = os.environ.get("ETOROAGENT_STATE_DIR") or STATE_DIR
     state_dir = Path(state_dir)
 
     args = _build_parser().parse_args(argv)
