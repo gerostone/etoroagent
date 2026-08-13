@@ -65,17 +65,21 @@ siempre, sin excepción:
   15. Presupuesto de órdenes en código (WP1, auditoría pre-producción: antes
       "máximo 3 órdenes por corrida" vivía solo en PLAYBOOK.md, en prosa, sin
       nada que lo hiciera cumplir). state/.run_orders.json trackea dos
-      contadores: por ETOROAGENT_RUN_ID (env var que runner.sh exporta por
-      corrida) hasta MAX_ORDERS_PER_RUN, y por día calendario (hora local)
-      hasta MAX_ORDERS_PER_DAY -- este último aplica SIEMPRE, incluso en
-      invocaciones manuales sin ETOROAGENT_RUN_ID seteada (ahí el tope por
-      corrida no se evalúa). Se chequea ANTES de abrir o cerrar (open y
-      close); si cualquiera de los dos topes está agotado, exit 2 sin tocar
-      el cliente HTTP. Se incrementa SOLO al ejecutar efectivamente una
-      orden (dry-run, real, o de resultado AMBIGUO) -- los bloqueos (exit 2,
-      sea por riesgo o por este mismo presupuesto) NUNCA consumen
-      presupuesto. Escritura atómica (tmp + os.replace), mismo patrón que
-      _atomic_write_json().
+      contadores: por run_id (ETOROAGENT_RUN_ID si está seteada, o un id
+      SINTÉTICO "manual-YYYY-MM-DD" en invocaciones manuales -- WP4/N4b, ver
+      _effective_run_id()) hasta MAX_ORDERS_PER_RUN, y por día calendario
+      (hora local) hasta MAX_ORDERS_PER_DAY. Se incrementa SOLO al ejecutar
+      efectivamente una orden (dry-run, real, o de resultado AMBIGUO) -- los
+      bloqueos (exit 2, sea por riesgo o por este mismo presupuesto) NUNCA
+      consumen presupuesto. Escritura atómica (tmp + os.replace), mismo
+      patrón que _atomic_write_json(). Si state/.run_orders.json existe pero
+      es ilegible/corrupto, se trata como presupuesto AGOTADO (fail-closed,
+      WP4/N3a) en vez de reiniciar contadores en 0 (fail-open) -- requiere
+      intervención manual, ver _OrderBudgetCorruptError.
+      WP4/N1 (re-auditoría, hallazgo CRÍTICO): este presupuesto aplica
+      SOLO a APERTURAS. Los CIERRES ni lo chequean ni lo consumen -- reducir
+      riesgo nunca debe esperar a que haya "presupuesto" disponible, mismo
+      principio fail-safe que ya regía la reconciliación (regla 16).
   16. Flag de reconciliación (WP2, auditoría pre-producción: se detectaron
       corridas que emiten órdenes y mueren -- corte de conexión con la API
       de Anthropic -- ANTES de journalear el razonamiento narrativo).
@@ -87,6 +91,17 @@ siempre, sin excepción:
       riesgo nunca debe esperar a una reconciliación (dirección
       fail-safe). Se chequea ANTES de despachar a _handle_open/_handle_close,
       igual que el presupuesto de órdenes (regla 15).
+
+  17. Aislamiento de state para tests/auditorías (WP4/N5): si el caller no
+      pasa el kwarg state_dir= (o corre este script como CLI real, sin poder
+      pasar kwargs de Python), main() usa la env var ETOROAGENT_STATE_DIR
+      como state_dir si está seteada, antes de caer al STATE_DIR real del
+      repo. Pensado para harnesses de test/auditoría que invocan el script
+      real por subprocess. La protección contra que el AGENTE la use para
+      evadir el presupuesto de órdenes o la reconciliación NO es este
+      fallback -- es scripts/risk_hook.py (WP4/N4a), que bloquea asignar
+      ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR inline junto a una invocación
+      de este script (o snapshot.py/candles.py/reconcile.py).
 
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp en hora local con offset y la razón pasada
@@ -683,7 +698,6 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
             f"| razon={args.reason}",
         )
         print(f"DRY_RUN: no se ejecuta close {position_id} {symbol}")
-        _consume_order_budget(state_dir)
         return 0
 
     try:
@@ -712,7 +726,6 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
             f"reintentar: {exc}",
             file=sys.stderr,
         )
-        _consume_order_budget(state_dir)
         return 1
 
     journal(
@@ -721,7 +734,6 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
         f"resultado={result} | razon={args.reason}",
     )
     print(f"CERRADA: {position_id} {symbol}")
-    _consume_order_budget(state_dir)
     return 0
 
 
@@ -761,35 +773,40 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
         print(f"BLOQUEADA: {staleness_msg}", file=sys.stderr)
         return 2
 
-    # WP1: presupuesto de órdenes (por corrida y/o diario, ver docstring del
-    # módulo, regla 15) -- se evalúa para open Y close, ANTES de despachar,
-    # para que un bloqueo acá jamás llegue a tocar el cliente HTTP ni,
-    # crucialmente, a consumir presupuesto él mismo.
-    budget_block_msg = _check_order_budget(state_dir)
-    if budget_block_msg:
-        journal(
-            state_dir, f"BLOQUEADA | {args.action} | {budget_block_msg} | razon={args.reason}"
-        )
-        print(f"BLOQUEADA: {budget_block_msg}", file=sys.stderr)
-        return 2
-
-    # WP2: reconciliacion pendiente tras una corrida abortada -- ver el
-    # comentario de NEEDS_RECONCILIATION_FILE mas arriba y PLAYBOOK.md
-    # §Reconciliacion tras corrida abortada. Solo bloquea
-    # aperturas: los cierres (reducir riesgo) siguen permitidos siempre.
-    if args.action == "open" and (state_dir / NEEDS_RECONCILIATION_FILE).exists():
-        recon_msg = (
-            "reconciliaci\u00f3n pendiente tras corrida abortada: revis\u00e1 posiciones vs "
-            "journal, journale\u00e1 RECONCILIACION y elimin\u00e1 state/.needs_reconciliation"
-        )
-        journal(
-            state_dir, f"BLOQUEADA | {args.action} | {recon_msg} | razon={args.reason}"
-        )
-        print(f"BLOQUEADA: {recon_msg}", file=sys.stderr)
-        return 2
-
     if args.action == "open":
+        # WP4/N1 (re-auditoría, hallazgo CRÍTICO): el presupuesto de órdenes
+        # (WP1, docstring regla 15) aplica SOLO a aperturas -- se evalúa ANTES
+        # de despachar, para que un bloqueo acá jamás llegue a tocar el
+        # cliente HTTP ni, crucialmente, a consumir presupuesto él mismo. Los
+        # CIERRES (más abajo) ni lo chequean ni lo consumen: reducir riesgo
+        # nunca debe esperar a que haya "presupuesto" disponible.
+        budget_block_msg = _check_order_budget(state_dir)
+        if budget_block_msg:
+            journal(
+                state_dir, f"BLOQUEADA | open | {budget_block_msg} | razon={args.reason}"
+            )
+            print(f"BLOQUEADA: {budget_block_msg}", file=sys.stderr)
+            return 2
+
+        # WP2: reconciliacion pendiente tras una corrida abortada -- ver el
+        # comentario de NEEDS_RECONCILIATION_FILE mas arriba y PLAYBOOK.md
+        # §Reconciliacion tras corrida abortada. Solo bloquea aperturas: los
+        # cierres (reducir riesgo) siguen permitidos siempre.
+        if (state_dir / NEEDS_RECONCILIATION_FILE).exists():
+            recon_msg = (
+                "reconciliaci\u00f3n pendiente tras corrida abortada: revis\u00e1 posiciones vs "
+                "journal, journale\u00e1 RECONCILIACION y elimin\u00e1 state/.needs_reconciliation"
+            )
+            journal(
+                state_dir, f"BLOQUEADA | open | {recon_msg} | razon={args.reason}"
+            )
+            print(f"BLOQUEADA: {recon_msg}", file=sys.stderr)
+            return 2
+
         return _handle_open(args, state, equity_rows, state_dir, make_client)
+
+    # Cierres: SIN chequeo de presupuesto y SIN chequeo de reconciliación
+    # (WP4/N1, WP2) -- dirección fail-safe, reducir riesgo nunca espera.
     return _handle_close(args, state, state_dir, make_client)
 
 

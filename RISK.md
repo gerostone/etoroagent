@@ -52,15 +52,24 @@ eludir, ni pedir que se relajen para una corrida puntual.
    cada uno individualmente bajo el 25%, podían sumar una concentración
    total sin ningún techo (3 símbolos al 25% cada uno = 75% era legal antes
    de este tope).
-8. **Presupuesto de órdenes: máximo 3 por corrida y 6 por día.** En código
-   (no solo en prosa de PLAYBOOK.md): `scripts/place_order.py` trackea en
-   `state/.run_orders.json` cuántas órdenes se ejecutaron (dry-run, reales,
-   o de resultado ambiguo -- nunca las bloqueadas) bajo el `ETOROAGENT_RUN_ID`
-   de la corrida actual (hasta 3; `runner.sh` exporta esa variable con un id
-   distinto por corrida) y en el día calendario local (hasta 6, aplica
-   siempre, incluso sin `ETOROAGENT_RUN_ID` seteada). Agotado cualquiera de
-   los dos topes, toda apertura o cierre se bloquea (exit 2) sin llegar a la
-   API, hasta la próxima corrida o el próximo día.
+8. **Presupuesto de órdenes: máximo 3 por corrida y 6 por día -- SOLO
+   aperturas.** En código (no solo en prosa de PLAYBOOK.md):
+   `scripts/place_order.py` trackea en `state/.run_orders.json` cuántas
+   APERTURAS se ejecutaron (dry-run, reales, o de resultado ambiguo --
+   nunca las bloqueadas) bajo el `ETOROAGENT_RUN_ID` de la corrida actual
+   (hasta 3; `runner.sh` exporta esa variable con un id distinto por
+   corrida) y en el día calendario local (hasta 6). Sin `ETOROAGENT_RUN_ID`
+   seteada (invocación manual), se usa un id sintético `manual-YYYY-MM-DD`
+   -- el tope de 3 por "corrida" aplica igual, por día. Agotado cualquiera
+   de los dos topes, toda APERTURA se bloquea (exit 2) sin llegar a la API,
+   hasta la próxima corrida o el próximo día. Los **CIERRES nunca chequean
+   ni consumen este presupuesto** -- reducir riesgo no puede depender de
+   cuántas órdenes se ejecutaron antes (mismo principio fail-safe que rige
+   el bloqueo por reconciliación pendiente, ver PLAYBOOK.md
+   §Reconciliación tras corrida abortada: los cierres siguen permitidos
+   igual). Si `state/.run_orders.json` existe pero es ilegible/corrupto, se
+   trata como presupuesto AGOTADO para aperturas (fail-closed) en vez de
+   reiniciar los contadores en 0.
 
 ## Límites adicionales (mismo nivel de exigencia)
 

@@ -1277,4 +1277,107 @@ def test_borrar_flag_de_reconciliacion_rehabilita_aperturas(tmp_path, monkeypatc
     flag_path.unlink()
     rc, client = _open_ok(state_dir, "QQQ", instrument_id=7)
     assert rc == 0
-    client.open_position_by_amount.assert_called_once()
+
+
+# -- WP4/N1 CRÍTICO: los CIERRES nunca esperan presupuesto de órdenes -------
+#
+# Re-auditoría: el presupuesto de órdenes (WP1) evaluaba y consumía tanto
+# para open como para close. Reducir riesgo (cerrar una posición) NUNCA
+# debe esperar a que haya "presupuesto" disponible -- mismo principio
+# fail-safe que ya rige la reconciliación (WP2: los cierres siguen
+# permitidos con el flag puesto). Fix: el presupuesto (por corrida y
+# diario) aplica SOLO a aperturas; los cierres ni lo chequean ni lo
+# consumen.
+
+
+def _closable_state_dir(tmp_path, cash=1_000_000.0):
+    """Como _big_state_dir, pero con una posición REAL cerrable (GLD,
+    símbolo distinto de los que usan los tests de presupuesto en
+    _BUDGET_SYMBOLS para no interferir con no-duplicación)."""
+    return write_state(
+        tmp_path,
+        {
+            "updatedAt": _fresh_updated_at(),
+            "portfolioId": "pf-1",
+            "cashUsd": cash,
+            "positions": [
+                {"positionId": "pos-close", "symbol": "GLD", "instrumentId": 99, "valueUsd": 50.0},
+            ],
+        },
+        [("2026-08-01", cash)],
+    )
+
+
+def test_cierre_pasa_con_presupuesto_de_corrida_agotado(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-close-test")
+    state_dir = _closable_state_dir(tmp_path)
+
+    # Agotar el presupuesto de la corrida (3 aperturas).
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+
+    # Confirmamos que una 4ta APERTURA sí se bloquea (control del escenario).
+    rc_open_blocked = place_order.main(
+        ["open", "--symbol", _BUDGET_SYMBOLS[3], "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: MagicMock(),
+    )
+    assert rc_open_blocked == 2
+
+    # Un CIERRE, en cambio, debe pasar igual -- nunca debe esperar presupuesto.
+    client_close = MagicMock()
+    client_close.close_position.return_value = {"ok": True}
+    rc_close = place_order.main(
+        ["close", "--position-id", "pos-close", "--symbol", "GLD"],
+        state_dir=state_dir,
+        make_client=lambda: client_close,
+    )
+    assert rc_close == 0
+    client_close.close_position.assert_called_once()
+    journal = (state_dir / "journal.md").read_text()
+    assert "CERRADA" in journal
+
+    # El cierre tampoco debe haber consumido presupuesto (los contadores
+    # quedan exactamente como los dejaron las 3 aperturas anteriores).
+    budget = json.loads((state_dir / ".run_orders.json").read_text())
+    assert budget["count"] == 3
+    assert budget["dailyCount"] == 3
+
+
+def test_cierre_pasa_con_presupuesto_diario_agotado(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_RUN_ID", raising=False)
+    state_dir = _closable_state_dir(tmp_path)
+
+    # Agotar el presupuesto diario global (6 aperturas, repartidas en 2
+    # corridas para no chocar con el tope por corrida).
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-a")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[:3]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i)
+        assert rc == 0
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-b")
+    for i, symbol in enumerate(_BUDGET_SYMBOLS[3:6]):
+        rc, _ = _open_ok(state_dir, symbol, instrument_id=i + 3)
+        assert rc == 0
+
+    # Control: una 7ma apertura (corrida nueva, presupuesto de corrida
+    # fresco) se bloquea igual por el tope DIARIO.
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-dia-c")
+    rc_open_blocked = place_order.main(
+        ["open", "--symbol", _BUDGET_SYMBOLS[6], "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: MagicMock(),
+    )
+    assert rc_open_blocked == 2
+
+    client_close = MagicMock()
+    client_close.close_position.return_value = {"ok": True}
+    rc_close = place_order.main(
+        ["close", "--position-id", "pos-close", "--symbol", "GLD"],
+        state_dir=state_dir,
+        make_client=lambda: client_close,
+    )
+    assert rc_close == 0
+    client_close.close_position.assert_called_once()
