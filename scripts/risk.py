@@ -15,6 +15,17 @@ Límites (spec §6, perfil Moderado) — NO negociables por el agente:
   agregado cierra el hueco de que N símbolos distintos, cada uno bajo el
   25%, sumaran una concentración total no acotada.
 
+  WP4 (re-auditoría): la no-duplicación original comparaba símbolo por
+  IGUALDAD DE STRING -- un alias distinto del mismo activo cripto (BTC en
+  cartera, open BTCUSD/BTC-USD/BTCEUR/btcusd) se veía como "otro símbolo"
+  y pasaba. canonical_symbol() colapsa cualquier variante con prefijo
+  BTC/ETH a un único canónico; se usa en no-duplicación, en la suma de
+  exposición cripto agregada, y en el chequeo de universo, para que los
+  tres vean el MISMO activo sin importar el alias pedido (N2). Además, el
+  filtro "valueUsd>0" de la no-duplicación original dejaba reabrir un
+  símbolo cuya posición existente estaba en 0 o negativo -- ahora es la
+  PRESENCIA del símbolo la que bloquea, cualquier valueUsd finito (N6).
+
 validate() es fail-closed: ante action="open" con state o equity_rows
 incompletos, malformados o con valores no numéricos/no finitos, bloquea la
 orden en vez de asumir defaults silenciosos. action="close" siempre se
@@ -97,6 +108,30 @@ def _norm_symbol(raw) -> str:
     if raw is None:
         return ""
     return str(raw).strip().upper()
+
+
+def canonical_symbol(raw) -> str:
+    """WP4/N2: normaliza (strip+upper, vía _norm_symbol) y además COLAPSA
+    cualquier alias de símbolo cripto a un canónico único ("BTC"/"ETH"),
+    para que no-duplicación, exposición cripto agregada y el chequeo de
+    universo no puedan evadirse abriendo el MISMO activo bajo un alias de
+    símbolo distinto (BTCUSD, BTC-USD, BTCEUR, btcusd, ...).
+
+    Deliberadamente NO es un mapeo explícito 1:1 contra CRYPTO_SYMBOLS/
+    CRYPTO_SEARCH_VARIANTS: es "empieza con BTC/ETH tras normalizar ->
+    colapsa", así que también cubre variantes de formato FUTURAS que eToro
+    pueda exponer y que hoy no estén listadas explícitamente en ningún
+    set (mismo espíritu que el comentario sobre CRYPTO_SYMBOLS más abajo:
+    una lista cerrada de variantes falla abierto ante un formato nuevo).
+
+    Símbolos no-cripto (ninguno del universo de equities empieza con BTC/
+    ETH) pasan sin cambios, ya normalizados."""
+    symbol = _norm_symbol(raw)
+    if symbol.startswith("BTC"):
+        return "BTC"
+    if symbol.startswith("ETH"):
+        return "ETH"
+    return symbol
 
 
 def _normalize_state(state: dict) -> tuple[float, list]:
@@ -204,7 +239,11 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
     if not symbol:
         return False, "Símbolo de orden inválido."
 
-    if symbol not in UNIVERSE:
+    # WP4/N2: canonical_symbol() para que un alias cripto no listado
+    # explícitamente en UNIVERSE (p.ej. una variante de formato nueva de
+    # eToro) siga reconociéndose como BTC/ETH en vez de bloquearse por un
+    # tecnicismo de formato -- ver docstring del módulo y de la función.
+    if canonical_symbol(symbol) not in UNIVERSE:
         return False, (
             f"Símbolo {symbol} fuera del universo operable — actualizar "
             "mapeo/universo antes de continuar."
@@ -217,13 +256,22 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
     if total <= 0:
         return False, "Valor de portfolio desconocido o cero: no se puede dimensionar."
 
-    # --- No-duplicación (WP1): CUALQUIER exposición existente en este
-    # símbolo (real o pending/local, valueUsd>0) bloquea el open, sin
-    # excepciones. Va ANTES del tope de 25% (que queda como defensa en
-    # profundidad) — mantener = no recomprar; rebalancear = cerrar en
-    # esta corrida y reevaluar en la siguiente, nunca sumar encima.
+    # --- No-duplicación (WP1, WP4/N2+N6): CUALQUIER exposición existente
+    # en este símbolo bloquea el open, sin excepciones. Va ANTES del tope
+    # de 25% (que queda como defensa en profundidad) — mantener = no
+    # recomprar; rebalancear = cerrar en esta corrida y reevaluar en la
+    # siguiente, nunca sumar encima.
+    #   N2: compara por canonical_symbol(), no por igualdad de string --
+    #   un alias cripto distinto del MISMO activo (BTC en cartera, open
+    #   BTCUSD) también bloquea.
+    #   N6: la condición es la PRESENCIA del símbolo en positions --
+    #   cualquier valueUsd finito (0, negativo o positivo) cuenta. El
+    #   filtro "valueUsd>0" original dejaba reabrir un símbolo cuya
+    #   posición existente estaba en 0 o negativo; sigue siendo LA MISMA
+    #   posición, no una plaza libre.
     if any(
-        p["symbol"] == symbol and p["valueUsd"] > 0 for p in normalized_positions
+        canonical_symbol(p["symbol"]) == canonical_symbol(symbol)
+        for p in normalized_positions
     ):
         return False, (
             "el símbolo ya tiene exposición: recompra/adición no permitida "
@@ -251,9 +299,15 @@ def validate(order: OrderRequest, state: dict, equity_rows: list) -> tuple[bool,
             f"({total_exposure:.2f} de {total:.2f} USD)."
         )
 
-    if symbol in CRYPTO_SYMBOLS:
+    # WP4/N2: canonical_symbol() en vez de pertenencia literal a
+    # CRYPTO_SYMBOLS -- así la suma agregada cubre también alias no
+    # listados explícitamente (p.ej. un formato nuevo de eToro), no solo
+    # las variantes ya conocidas.
+    if canonical_symbol(symbol) in ("BTC", "ETH"):
         crypto = sum(
-            p["valueUsd"] for p in normalized_positions if p["symbol"] in CRYPTO_SYMBOLS
+            p["valueUsd"]
+            for p in normalized_positions
+            if canonical_symbol(p["symbol"]) in ("BTC", "ETH")
         )
         if (crypto + order.amount_usd) / total > MAX_CRYPTO_PCT:
             return False, (

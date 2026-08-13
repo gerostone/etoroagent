@@ -9,6 +9,7 @@ from risk import (
     CRYPTO_SEARCH_VARIANTS,
     MAX_TOTAL_EXPOSURE_PCT,
     OrderRequest,
+    canonical_symbol,
     validate,
     drawdown_pct,
     portfolio_value,
@@ -393,16 +394,31 @@ def test_permite_open_simbolo_nuevo_sin_posicion_previa():
     assert ok, msg
 
 
-def test_permite_open_simbolo_con_posicion_valueusd_cero_o_negativa():
-    # valueUsd<=0 no cuenta como "exposición" a los fines de no-duplicación
-    # (spec: "valueUsd>0") — una posición residual en cero o negativa no
-    # bloquea reabrir el símbolo.
+# --- WP4/N6: re-auditoría -- valueUsd<=0 evadía la no-duplicación ---------
+#
+# Hallazgo: el filtro original "valueUsd>0" dejaba reabrir un símbolo cuya
+# posición existente estaba en 0 o negativo. La regla correcta es la
+# PRESENCIA del símbolo en positions (cualquier valueUsd FINITO, incluido
+# 0 o negativo) bloquea la recompra -- una posición con pnl negativo sigue
+# siendo LA MISMA posición, no una plaza libre para abrir de nuevo.
+
+
+def test_bloquea_recompra_con_valueusd_cero_por_presencia():
     state = {
         "cashUsd": 1000.0,
         "positions": [{"symbol": "SPY", "valueUsd": 0.0}],
     }
     ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
-    assert ok, msg
+    assert not ok and "no-duplicaci" in msg.lower()
+
+
+def test_bloquea_recompra_con_valueusd_negativo_por_presencia():
+    state = {
+        "cashUsd": 1000.0,
+        "positions": [{"symbol": "SPY", "valueUsd": -50.0}],
+    }
+    ok, msg = validate(open_order(symbol="SPY", amount=10.0), state, EQUITY_OK)
+    assert not ok and "no-duplicaci" in msg.lower()
 
 
 # --- WP1: tope de exposición agregada (MAX_TOTAL_EXPOSURE_PCT = 70%) -------
@@ -456,3 +472,101 @@ def test_tope_exposicion_total_mensaje_deriva_de_la_constante():
 
 def test_max_total_exposure_pct_vale_70pct():
     assert MAX_TOTAL_EXPOSURE_PCT == 0.70
+
+
+# --- WP4/N2: canonicalización de alias cripto -------------------------------
+#
+# Re-auditoría: eToro puede exponer BTC bajo distintos formatos de símbolo
+# (BTCUSD, BTC-USD, BTCEUR, minúsculas...) y risk.py los trataba como
+# activos DISTINTOS para no-duplicación y exposición cripto agregada --
+# comparación literal de string, no de activo real. Escenario del auditor:
+# BTC 9.83 en cartera, open BTCUSD 1000 pasaba (símbolo "distinto"), y
+# repetir con BTC-USD y BTCEUR podía acumular exposición sin techo real.
+# canonical_symbol() colapsa cualquier variante con prefijo BTC/ETH (tras
+# normalizar) a un único canónico, para que no-duplicación, exposición
+# cripto agregada, y el chequeo de universo vean el MISMO activo sin
+# importar bajo qué alias se pida.
+
+
+def test_canonical_symbol_colapsa_alias_btc():
+    assert canonical_symbol("BTC") == "BTC"
+    assert canonical_symbol("btcusd") == "BTC"
+    assert canonical_symbol("BTC-USD") == "BTC"
+    assert canonical_symbol("BTCEUR") == "BTC"
+    assert canonical_symbol("  btc-usd  ") == "BTC"
+
+
+def test_canonical_symbol_colapsa_alias_eth():
+    assert canonical_symbol("ETH") == "ETH"
+    assert canonical_symbol("ethusd") == "ETH"
+    assert canonical_symbol("ETH-USD") == "ETH"
+    assert canonical_symbol("ETHEUR") == "ETH"
+
+
+def test_canonical_symbol_no_afecta_equities():
+    assert canonical_symbol("spy") == "SPY"
+    assert canonical_symbol("QQQ") == "QQQ"
+    assert canonical_symbol("xlk") == "XLK"
+
+
+def test_canonical_symbol_none_o_vacio():
+    assert canonical_symbol(None) == ""
+    assert canonical_symbol("") == ""
+
+
+def test_bloquea_recompra_btc_via_alias_btcusd_escenario_auditor():
+    # Escenario EXACTO reportado por el auditor: BTC 9.83 en cartera, open
+    # BTCUSD 1000 -- antes de N2 esto pasaba (símbolo "distinto").
+    state = {"cashUsd": 10000.0, "positions": [{"symbol": "BTC", "valueUsd": 9.83}]}
+    ok, msg = validate(open_order(symbol="BTCUSD", amount=1000.0), state, EQUITY_OK)
+    assert not ok and "no-duplicaci" in msg.lower()
+
+
+def test_bloquea_recompra_btc_via_todos_los_alias_cruzados():
+    alias_existentes = ["BTC", "BTCUSD", "BTC-USD", "BTCEUR"]
+    alias_nuevos = ["BTC", "BTCUSD", "BTC-USD", "BTCEUR", "btcusd"]
+    for existente in alias_existentes:
+        state = {"cashUsd": 10000.0, "positions": [{"symbol": existente, "valueUsd": 9.83}]}
+        for nuevo in alias_nuevos:
+            ok, msg = validate(open_order(symbol=nuevo, amount=1000.0), state, EQUITY_OK)
+            assert not ok, f"{existente} en cartera debería bloquear open de {nuevo}"
+            assert "no-duplicaci" in msg.lower()
+
+
+def test_permite_open_eth_con_btc_existente_alias_distinto():
+    # Control negativo: BTC (cualquier alias) NO debe bloquear ETH -- son
+    # activos distintos, canonical_symbol no debe fusionarlos.
+    state = {"cashUsd": 10000.0, "positions": [{"symbol": "BTCUSD", "valueUsd": 9.83}]}
+    ok, msg = validate(open_order(symbol="ETH", amount=10.0), state, EQUITY_OK)
+    assert ok, msg
+
+
+def test_exposicion_cripto_agregada_cubre_alias_no_listado_explicitamente():
+    # "BTCGBP" no está en CRYPTO_SYMBOLS (lista cerrada) pero claramente es
+    # BTC por prefijo -- antes de canonical_symbol(), esta posición NO
+    # contaba contra el 35% cripto (fallaba abierto ante formatos nuevos).
+    state = {
+        "cashUsd": 100.0,
+        "positions": [{"symbol": "BTCGBP", "valueUsd": 30.0}],
+    }  # total = 130
+    # ETH nuevo: no-dup no interviene (BTCGBP canonicaliza a BTC, != ETH).
+    # (30 + 20) / 130 = 38.46% > 35% -> debe bloquear por cripto agregado.
+    ok, msg = validate(open_order(symbol="ETH", amount=20.0), state, EQUITY_OK)
+    assert not ok and "cripto" in msg.lower()
+
+
+def test_universo_acepta_alias_cripto_no_listado_explicitamente_via_canonical():
+    # El chequeo de universo también usa canonical_symbol: un alias BTC no
+    # listado en UNIVERSE (p.ej. "BTCGBP") pasa igual porque canonicaliza a
+    # "BTC" (que sí está).
+    state = {"cashUsd": 1000.0, "positions": []}
+    ok, msg = validate(open_order(symbol="BTCGBP", amount=10.0), state, EQUITY_OK)
+    assert ok, msg
+
+
+def test_universo_sigue_bloqueando_simbolo_no_cripto_desconocido():
+    # Control: un símbolo desconocido que NO empieza con BTC/ETH sigue
+    # bloqueado igual que antes (canonical_symbol no lo cambia).
+    state = {"cashUsd": 1000.0, "positions": []}
+    ok, msg = validate(open_order(symbol="AAPL"), state, EQUITY_OK)
+    assert not ok and "universo" in msg.lower()
