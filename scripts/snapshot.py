@@ -31,6 +31,16 @@ Sin carga de .env acá (la hace runner.sh). Sin retries extra más allá de los
 que ya maneja EtoroClient ante 429. Este script es solo lectura, pero
 mantiene el principio general del proyecto de no reintentar nada de trading.
 
+WP4/N5 (re-auditoría): main() honra la env var ETOROAGENT_STATE_DIR para
+redirigir state/ (si está seteada), antes de caer al STATE_DIR real del
+repo -- pensado para harnesses de test/auditoría que invocan este script
+real por subprocess, no para uso normal del agente. La protección contra
+que el AGENTE la use para evadir el presupuesto de órdenes o la
+reconciliación (ver place_order.py) NO es este fallback -- es
+scripts/risk_hook.py (WP4/N4a), que bloquea asignar
+ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR inline junto a una invocación de
+este script (o place_order.py/candles.py/reconcile.py).
+
 HALLAZGOS FAIL-OPEN adicionales (2da ronda de review), también resueltos acá:
   - ordersForOpen[mirrorID==0] (aperturas pendientes) se restaban de cashUsd
     pero no aparecían en positions[]: risk.py no veía esa exposición al
@@ -518,9 +528,11 @@ def main():
 
         state = build_state(portfolio_id, pnl, symbol_by_id)
 
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        positions_path = STATE_DIR / POSITIONS_FILE
-        equity_path = STATE_DIR / EQUITY_FILE
+        # WP4/N5: ver docstring del módulo.
+        state_dir = Path(os.environ.get("ETOROAGENT_STATE_DIR") or STATE_DIR)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        positions_path = state_dir / POSITIONS_FILE
+        equity_path = state_dir / EQUITY_FILE
 
         # Equity oficial para la curva histórica, NO cashUsd + Σ(valueUsd) del
         # state (ese cálculo ignora órdenes pendientes — ver compute_equity()).
