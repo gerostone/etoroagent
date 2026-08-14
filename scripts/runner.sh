@@ -7,6 +7,15 @@
 # sombra de integridad fuera del repo (scripts/shadow_sync.py) antes de
 # lanzar `claude` y despues de que termina (haya operado o no) -- ver el
 # docstring de shadow_sync.py para el algoritmo de merge exacto.
+#
+# WP8: despues de la sincronizacion POST-corrida (el orden importa: sync
+# primero -- nunca sincroniza hacia abajo --, chequeo despues), corre
+# scripts/integrity_check.py. Si detecta una divergencia (exit 3):
+# journalea, crea state/.needs_reconciliation (bloquea aperturas por el
+# mecanismo ya existente), notifica al operador, y descarga ambos jobs de
+# launchd (kill-switch) para que no vuelva a correr desatendido hasta
+# revision manual. Un fallo del chequeo mismo (exit 1) solo journalea un
+# WARN -- no frena la operacion, la prevencion de WP7 sigue activa.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:?uso: runner.sh equities|crypto}"
@@ -159,5 +168,38 @@ sync_shadow  # WP7: ANTES de lanzar claude.
 }
 
 sync_shadow  # WP7: DESPUÉS de que claude termina (haya operado o no).
+
+# WP8: deteccion de divergencia archivo-vs-sombra (compuesto de dos
+# sustituciones coordinadas, una sobre state/ y otra sobre la sombra, que
+# la prevencion de WP7 por si sola no puede cerrar del todo -- ver el
+# docstring de scripts/integrity_check.py). El orden importa: DESPUES del
+# sync de arriba, nunca antes.
+INTEGRITY_LOG="reports/${STAMP}-${MODE}-integrity.log"
+set +e
+/usr/bin/python3 scripts/integrity_check.py > "$INTEGRITY_LOG" 2>&1
+INTEGRITY_RC=$?
+set -e
+
+if [ "$INTEGRITY_RC" -eq 3 ]; then
+  printf -- "- %s INTEGRIDAD | divergencia archivo-vs-sombra detectada | ver %s | launchd descargado, aperturas bloqueadas -- revision manual requerida\n" \
+    "$(date +"%Y-%m-%d %H:%M %z")" "$INTEGRITY_LOG" >> state/journal.md
+  # Mismo mecanismo que ya bloquea aperturas tras una corrida abortada
+  # (WP2, ver mas arriba) -- reconcile.py --done exige revision manual
+  # antes de poder borrar este flag.
+  printf '{\n  "reason": "divergencia de integridad archivo-vs-sombra",\n  "log": "%s",\n  "at": "%s"\n}\n' \
+    "$INTEGRITY_LOG" "$(date +"%Y-%m-%d %H:%M %z")" > state/.needs_reconciliation
+  osascript -e "display notification \"divergencia de integridad detectada -- corridas reales suspendidas\" with title \"etoro-agent\"" || true
+  # Kill-switch: descarga ambos jobs de launchd para que no vuelva a
+  # correr desatendido. DETACHADO y con una pausa corta a proposito: el
+  # runner puede estar corriendo BAJO uno de esos mismos jobs -- si lo
+  # descargamos en linea, launchd podria matar este proceso a mitad de
+  # su propio cleanup (trap EXIT, liberacion del lock). El journal de
+  # arriba YA quedo escrito antes de disparar esto.
+  nohup bash -c 'sleep 2; launchctl unload "$HOME/Library/LaunchAgents/com.etoroagent.equities.plist" "$HOME/Library/LaunchAgents/com.etoroagent.crypto.plist"' >/dev/null 2>&1 &
+elif [ "$INTEGRITY_RC" -eq 1 ]; then
+  echo "WARN: integrity_check.py falló (rc=1) -- ver $INTEGRITY_LOG" >&2
+  printf -- "- %s WARN | integrity_check.py falló, no se detiene la operación | ver %s\n" \
+    "$(date +"%Y-%m-%d %H:%M %z")" "$INTEGRITY_LOG" >> state/journal.md
+fi
 
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"

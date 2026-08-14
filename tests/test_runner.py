@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,8 @@ RUNNER = ROOT / "scripts" / "runner.sh"
 JOURNAL = ROOT / "state" / "journal.md"
 NEEDS_RECONCILIATION = ROOT / "state" / ".needs_reconciliation"
 LOCK_DIR = ROOT / "state" / ".runner.lock"
+EQUITY_CSV = ROOT / "state" / "equity.csv"
+RUN_ORDERS_JSON = ROOT / "state" / ".run_orders.json"
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin" and not RUNNER.exists(),
@@ -233,5 +236,151 @@ def test_sombra_sincronizada_incluso_si_claude_aborta(real_state_backup, tmp_pat
             assert (shadow_dir / "equity-shadow.csv").exists()
     finally:
         _cleanup_report_log(result.stdout)
+        if NEEDS_RECONCILIATION.exists():
+            NEEDS_RECONCILIATION.unlink()
+
+
+# --- WP8: detección de divergencia + kill-switch automático ----------------
+#
+# El compuesto de dos sustituciones coordinadas (una sobre state/, otra
+# sobre la sombra) queda como riesgo residual en la PREVENCIÓN de WP7 --
+# scripts/integrity_check.py lo convierte en DETECCIÓN: runner.sh lo
+# corre después de la sincronización post-corrida y, ante una
+# divergencia, journalea, crea el flag de reconciliación (bloquea
+# aperturas por el mecanismo ya existente), notifica, y descarga ambos
+# jobs de launchd (kill-switch, detachado). El kill-switch invoca
+# `launchctl` real -- estos tests lo mockean con un stub en PATH que solo
+# registra la invocación, para no tocar launchd real de la máquina.
+#
+# Simula la divergencia con un CLAUDE_BIN falso que sobrescribe
+# state/equity.csv (el archivo real del repo, sin forma de aislarlo --
+# mismo criterio que el resto de este archivo) con una única fila de
+# valor bajo DESPUÉS de que el sync PRE-corrida ya capturó el pico
+# histórico real en la sombra (bajo HOME redirigido) -- reproduce
+# exactamente el patrón "el archivo real terminó por debajo de lo que la
+# sombra ya vio". state/equity.csv y state/.run_orders.json se
+# respaldan/restauran explícitamente, además de journal.md y el flag.
+
+
+def _fake_launchctl_stub(bin_dir: Path, marker_path: Path) -> None:
+    """Escribe un `launchctl` ejecutable en bin_dir que solo registra sus
+    argumentos en marker_path y sale 0 -- para que el kill-switch de
+    runner.sh no invoque el launchctl real de la máquina durante el test."""
+    launchctl = bin_dir / "launchctl"
+    launchctl.write_text(
+        "#!/bin/bash\n"
+        f'echo "launchctl $*" >> "{marker_path}"\n'
+        "exit 0\n"
+    )
+    launchctl.chmod(0o755)
+
+
+def test_divergencia_de_integridad_journalea_flag_y_dispara_killswitch(tmp_path):
+    equity_backup = _backup(EQUITY_CSV)
+    budget_backup = _backup(RUN_ORDERS_JSON)
+    journal_backup = _backup(JOURNAL)
+    recon_backup = _backup(NEEDS_RECONCILIATION)
+    result = None
+
+    try:
+        home_dir = tmp_path / "home"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "launchctl_calls.txt"
+        _fake_launchctl_stub(bin_dir, marker)
+
+        # Sobrescribe state/equity.csv (el archivo REAL) con una única
+        # fila de valor bajo, DESPUÉS de que runner.sh ya haya corrido el
+        # sync PRE-corrida (que captura el pico histórico real en la
+        # sombra, bajo HOME redirigido) -- simula el archivo real
+        # quedando por debajo de lo que la sombra ya vio.
+        fake_claude = tmp_path / "fake_claude.sh"
+        fake_claude.write_text(
+            "#!/bin/bash\n"
+            "mkdir -p state\n"
+            "printf 'date,total\\n2099-01-01,1.0\\n' > state/equity.csv\n"
+            "exit 0\n"
+        )
+        fake_claude.chmod(0o755)
+
+        result = _run_runner(
+            "crypto",
+            {
+                "CLAUDE_BIN": str(fake_claude),
+                "DRY_RUN": "1",
+                "HOME": str(home_dir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        journal_text = JOURNAL.read_text()
+        assert "INTEGRIDAD" in journal_text
+        assert "divergencia" in journal_text.lower()
+
+        assert NEEDS_RECONCILIATION.exists()
+        flag_data = json.loads(NEEDS_RECONCILIATION.read_text())
+        assert "integridad" in flag_data["reason"].lower()
+        assert flag_data["at"]
+
+        # El kill-switch corre detachado (nohup ... sleep 2 ... &) -- se
+        # espera a que termine para verificar que invocó el stub.
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.5)
+
+        assert marker.exists(), "el kill-switch no invocó el launchctl stub a tiempo"
+        calls = marker.read_text()
+        assert "unload" in calls
+        assert "com.etoroagent.equities.plist" in calls
+        assert "com.etoroagent.crypto.plist" in calls
+    finally:
+        _restore(EQUITY_CSV, equity_backup)
+        _restore(RUN_ORDERS_JSON, budget_backup)
+        _restore(JOURNAL, journal_backup)
+        _restore(NEEDS_RECONCILIATION, recon_backup)
+        if result is not None:
+            _cleanup_report_log(result.stdout)
+        for stray_log in (ROOT / "reports").glob("*-crypto-integrity.log"):
+            stray_log.unlink()
+        pidfile = LOCK_DIR / "pid"
+        if pidfile.exists():
+            pidfile.unlink()
+        if LOCK_DIR.exists():
+            try:
+                LOCK_DIR.rmdir()
+            except OSError:
+                pass
+
+
+def test_integridad_intacta_no_journalea_ni_dispara_killswitch(real_state_backup, tmp_path):
+    # Control negativo: una corrida normal (sin divergencia) no debe
+    # journalear INTEGRIDAD ni tocar el flag de reconciliación.
+    home_dir = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "launchctl_calls.txt"
+    _fake_launchctl_stub(bin_dir, marker)
+
+    result = _run_runner(
+        "crypto",
+        {
+            "CLAUDE_BIN": "/usr/bin/false",
+            "DRY_RUN": "1",
+            "HOME": str(home_dir),
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        },
+    )
+    try:
+        assert result.returncode == 0, result.stdout + result.stderr
+        journal_text = JOURNAL.read_text()
+        assert "INTEGRIDAD" not in journal_text
+        time.sleep(3)
+        assert not marker.exists(), "el kill-switch no debía dispararse sin divergencia"
+    finally:
+        _cleanup_report_log(result.stdout)
+        for stray_log in (ROOT / "reports").glob("*-crypto-integrity.log"):
+            stray_log.unlink()
         if NEEDS_RECONCILIATION.exists():
             NEEDS_RECONCILIATION.unlink()
