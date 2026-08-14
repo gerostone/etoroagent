@@ -45,14 +45,17 @@ la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
       que no mencione ninguno de los cuatro archivos protegidos.
       `scripts/reconcile.py --done` sigue siendo la única vía para
       borrar el flag de reconciliación (verifica el journal antes).
-  (D) WP4/N4a: asignar ETOROAGENT_RUN_ID o ETOROAGENT_STATE_DIR inline
-      (export o prefijo VAR=valor) en un comando que además invoque
+  (D) WP4/N4a, ampliado por WP7/pieza 3: asignar ETOROAGENT_RUN_ID,
+      ETOROAGENT_STATE_DIR o ETOROAGENT_AUTHORIZED_RUN inline (export o
+      prefijo VAR=valor) en un comando que además invoque
       scripts/place_order.py, scripts/snapshot.py, scripts/candles.py o
       scripts/reconcile.py. runner.sh setea estas variables por entorno
       heredado, antes de invocar `claude` -- el agente nunca necesita
       asignarlas inline. Si pudiera, resetearía a voluntad el presupuesto
-      de órdenes por corrida (WP1) o redirigiría state/ para evadir la
-      reconciliación pendiente (WP2) o el presupuesto (WP1).
+      de órdenes por corrida (WP1), redirigiría state/ para evadir la
+      reconciliación pendiente (WP2) o el presupuesto (WP1), o se
+      auto-autorizaría a operar en modo real sin haber pasado por
+      runner.sh (WP7).
 
 Vias de LECTURA autorizadas (no las bloquea, no necesitan caso especial:
 su invocacion normal no contiene ningun patron vigilado en el texto del
@@ -156,9 +159,10 @@ MENSAJE_GUARDRAIL = (
 MENSAJE_ESTADO_PROTEGIDO = (
     "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): "
     "state/.run_orders.json, state/.needs_reconciliation, "
-    "state/positions.json y state/equity.csv son archivos de control -- "
-    "DEFAULT-DENY (WP6): cualquier comando Bash que los MENCIONE se "
-    "bloquea, salvo (a) invocar scripts/place_order.py, "
+    "state/positions.json, state/equity.csv, y la sombra de integridad "
+    "fuera del repo (equity-shadow/run-orders-shadow, WP7) son archivos "
+    "de control -- DEFAULT-DENY (WP6): cualquier comando Bash que los "
+    "MENCIONE se bloquea, salvo (a) invocar scripts/place_order.py, "
     "scripts/snapshot.py, scripts/candles.py o scripts/reconcile.py, o "
     "(b) una lectura pura y COMPLETA (cat/head/tail/less/more/wc/ls/stat/"
     "grep/diff, o `python3 -m json.tool`), sin ningun otro operador de "
@@ -170,12 +174,13 @@ MENSAJE_ESTADO_PROTEGIDO = (
 
 MENSAJE_ENV_SPOOF = (
     "BLOQUEADO por el motor de riesgo (scripts/risk_hook.py): no se permite "
-    "asignar ETOROAGENT_RUN_ID ni ETOROAGENT_STATE_DIR inline (export o "
-    "prefijo VAR=valor) en un comando que invoque scripts/place_order.py, "
-    "scripts/snapshot.py, scripts/candles.py o scripts/reconcile.py -- esas "
-    "variables las setea runner.sh por entorno heredado, nunca el agente. "
-    "Asignarlas inline evade el presupuesto de ordenes por corrida y/o "
-    "el aislamiento de state usado en tests.\n"
+    "asignar ETOROAGENT_RUN_ID, ETOROAGENT_STATE_DIR ni "
+    "ETOROAGENT_AUTHORIZED_RUN inline (export o prefijo VAR=valor) en un "
+    "comando que invoque scripts/place_order.py, scripts/snapshot.py, "
+    "scripts/candles.py o scripts/reconcile.py -- esas variables las setea "
+    "runner.sh por entorno heredado, nunca el agente. Asignarlas inline "
+    "evade el presupuesto de ordenes por corrida, el aislamiento de state "
+    "usado en tests, y/o la autorizacion de corridas reales (WP7).\n"
 )
 
 API_DOMAIN = "public-api.etoro.com"
@@ -631,7 +636,8 @@ def _escribe_sobre_guardrail(segmento: str) -> bool:
 
 
 _ENV_SPOOF_ASSIGN_RE = re.compile(
-    r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR)\s*="
+    r"\b(?:export\s+)?(?:ETOROAGENT_RUN_ID|ETOROAGENT_STATE_DIR|"
+    r"ETOROAGENT_AUTHORIZED_RUN)\s*="
 )
 _ENV_SPOOF_SCRIPT_RE = re.compile(
     r"scripts/(?:place_order|snapshot|candles|reconcile)\.py\b"
@@ -694,6 +700,17 @@ PROTECTED_STATE_FILES = (
     ".needs_reconciliation",
     "positions.json",
     "equity.csv",
+    # WP7/pieza 2: los dos archivos de la sombra de integridad fuera del
+    # repo (scripts/shadow_sync.py, $HOME/Library/Application Support/
+    # etoroagent/). No son archivos DENTRO de state/ -- viven fuera del
+    # repo a propósito -- pero un comando Bash que los mencione (p.ej.
+    # intentando leerlos/tocarlos para razonar sobre cuánto presupuesto o
+    # drawdown "cree" tener la sombra) cae bajo el mismo default-deny: el
+    # agente no tiene ninguna razón legítima para tocarlos, solo
+    # scripts/shadow_sync.py (invocado por runner.sh, nunca por el
+    # agente) los escribe.
+    "equity-shadow",
+    "run-orders-shadow",
 )
 
 _MENCION_ESTADO_PROTEGIDO_RE = re.compile(

@@ -1212,3 +1212,76 @@ def test_bloquea_grep_con_pipe_de_shell_real_pese_a_comillas_en_otro_lado():
     # otra parte.
     r = run_hook('grep "BTC" state/positions.json | bash')
     assert r.returncode == 2
+
+
+# --- WP7: sombra de integridad + autorización de corridas reales -----------
+#
+# Pieza 2: equity-shadow y run-orders-shadow (los dos archivos de la
+# sombra de integridad fuera del repo, ver scripts/shadow_sync.py) se
+# agregan a PROTECTED_STATE_FILES -- mismo default-deny por mención que
+# ya protegía los cuatro archivos de state/. Pieza 3: asignar
+# ETOROAGENT_AUTHORIZED_RUN inline junto a un script autorizado se
+# bloquea con el mismo criterio que ya regía para ETOROAGENT_RUN_ID/
+# ETOROAGENT_STATE_DIR (WP4/N4a).
+
+
+def test_bloquea_mencion_de_equity_shadow():
+    r = run_hook("rm /tmp/etoroagent-shadow/equity-shadow.csv")
+    assert r.returncode == 2
+
+
+def test_bloquea_mencion_de_run_orders_shadow():
+    r = run_hook("cat equity-shadow.csv > run-orders-shadow.json")
+    assert r.returncode == 2
+
+
+def test_permite_lectura_pura_de_equity_shadow():
+    r = run_hook("cat /tmp/etoroagent-shadow/equity-shadow.csv")
+    assert r.returncode == 0
+
+
+def test_permite_lectura_pura_de_run_orders_shadow():
+    r = run_hook("grep count /tmp/etoroagent-shadow/run-orders-shadow.json")
+    assert r.returncode == 0
+
+
+def test_bloquea_shadow_sync_no_es_script_autorizado_para_la_excepcion_de_mencion():
+    # scripts/shadow_sync.py NO está en la lista de los 4 scripts
+    # autorizados que exime la regla (C) de default-deny por mención --
+    # invocarlo mencionando un archivo protegido sigue bloqueado (no hay
+    # excepción de script autorizado para shadow_sync.py, a propósito: el
+    # agente nunca debe invocarlo, solo runner.sh).
+    r = run_hook("python3 scripts/shadow_sync.py --shadow-dir /tmp/x/run-orders-shadow.json")
+    assert r.returncode == 2
+
+
+def test_bloquea_authorized_run_inline_prefijo_con_place_order():
+    r = run_hook(
+        "ETOROAGENT_AUTHORIZED_RUN=1 .venv/bin/python scripts/place_order.py "
+        "open --symbol SPY --amount 10 --stop-loss-pct 0.1"
+    )
+    assert r.returncode == 2
+    assert "ETOROAGENT_AUTHORIZED_RUN" in r.stderr
+
+
+def test_bloquea_export_authorized_run_encadenado_con_place_order():
+    r = run_hook(
+        "export ETOROAGENT_AUTHORIZED_RUN=1 && .venv/bin/python "
+        "scripts/place_order.py open --symbol SPY --amount 10 --stop-loss-pct 0.1"
+    )
+    assert r.returncode == 2
+
+
+def test_bloquea_authorized_run_inline_con_snapshot():
+    r = run_hook("ETOROAGENT_AUTHORIZED_RUN=1 .venv/bin/python scripts/snapshot.py")
+    assert r.returncode == 2
+
+
+def test_permite_asignacion_de_authorized_run_sin_script_autorizado():
+    r = run_hook("ETOROAGENT_AUTHORIZED_RUN=1 echo hola")
+    assert r.returncode == 0
+
+
+def test_permite_mencion_de_authorized_run_sin_asignacion():
+    r = run_hook('echo "corriendo con ETOROAGENT_AUTHORIZED_RUN $ETOROAGENT_AUTHORIZED_RUN"')
+    assert r.returncode == 0

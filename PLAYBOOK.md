@@ -127,6 +127,31 @@ reconciliación", "el presupuesto de órdenes") en vez de nombrarlos
 literalmente -- nombrarlos bloquea el comando Bash aunque el destino real
 sea `state/journal.md`.
 
+## Autorización de corridas reales
+
+Una corrida con `DRY_RUN=0` es **LEGÍTIMA** si y solo si
+`ETOROAGENT_AUTHORIZED_RUN=1` está en tu entorno (lo setea
+`scripts/runner.sh`, la única vía de lanzamiento sancionada -- ya sea
+lanzado por launchd o por el operador a mano, ambas vías pasan por el
+runner y son sancionadas por definición).
+
+- **Si está presente:** procedé normalmente **sin pedir confirmación** --
+  los límites deterministas (`scripts/risk.py`, el presupuesto de
+  órdenes, la sombra de integridad fuera del repo) son tu protección, y
+  pedir confirmación en una corrida headless aborta la corrida sin
+  aportar ningún valor real (no hay nadie del otro lado para responder).
+- **Si `DRY_RUN=0` pero la variable NO está** (o vale algo distinto de
+  `1`): **no ejecutes órdenes de apertura**, journaleá la anomalía con
+  el motivo, y terminá la corrida sin operar -- como corresponde ante
+  cualquier violación de la regla de oro (§Reglas duras). `scripts/
+  place_order.py` ya bloquea aperturas en este caso (exit 2,
+  "corrida real no autorizada"); tu tarea es solo journalear con
+  claridad, no intentar sortearlo de ninguna forma.
+- Los **cierres** por señal de salida están siempre permitidos en
+  corridas legítimas, autorizadas o no -- reducir riesgo nunca depende
+  de esta variable (misma dirección fail-safe que ya rige para el
+  presupuesto de órdenes y la reconciliación pendiente).
+
 ## Universo operable
 
 Universo cerrado: exactamente los símbolos definidos en `UNIVERSE` de
