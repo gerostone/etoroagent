@@ -10,11 +10,12 @@
 #
 # WP8: despues de la sincronizacion POST-corrida (el orden importa: sync
 # primero -- nunca sincroniza hacia abajo --, chequeo despues), corre
-# scripts/integrity_check.py. Si detecta una divergencia (exit 3):
-# journalea, crea state/.needs_reconciliation (bloquea aperturas por el
-# mecanismo ya existente), notifica al operador, y descarga ambos jobs de
-# launchd (kill-switch) para que no vuelva a correr desatendido hasta
-# revision manual.
+# scripts/integrity_check.py. Ante una divergencia (exit 3) O un fallo
+# del chequeo mismo (exit 1, WP8b -- ver mas abajo): journalea, crea
+# state/.needs_reconciliation (bloquea aperturas por el mecanismo ya
+# existente), notifica al operador, y descarga ambos jobs de launchd
+# (kill-switch) para que no vuelva a correr desatendido hasta revision
+# manual.
 #
 # WP8b (sign-off del auditor sobre WP8): comparar archivo contra sombra
 # no alcanza si un compuesto de sustituciones coordinadas envenena AMBOS
@@ -28,9 +29,10 @@
 # retenido en memoria, es divergencia, sin importar que archivo y sombra
 # sigan de acuerdo entre si (ver check_peak_monotonicity en
 # scripts/integrity_check.py para el calculo exacto -- este script solo
-# transporta el numero). Ademas, un fallo del chequeo mismo (exit 1) hoy
-# frena igual que una divergencia (exit 3): un verificador que no puede
-# leerse a si mismo no puede certificar integridad.
+# transporta el numero). Ademas, exit 1 (el chequeo mismo no pudo
+# leerse/completarse) ahora frena por el MISMO camino que una divergencia
+# real -- un verificador que no puede certificar integridad no es
+# evidencia de que todo este bien.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:?uso: runner.sh equities|crypto}"
@@ -213,15 +215,28 @@ fi
 INTEGRITY_RC=$?
 set -e
 
-if [ "$INTEGRITY_RC" -eq 3 ]; then
-  printf -- "- %s INTEGRIDAD | divergencia archivo-vs-sombra detectada | ver %s | launchd descargado, aperturas bloqueadas -- revision manual requerida\n" \
-    "$(date +"%Y-%m-%d %H:%M %z")" "$INTEGRITY_LOG" >> state/journal.md
+# WP8b: rc=3 (divergencia detectada) Y rc=1 (el verificador mismo esta
+# roto/no pudo leerse) frenan por el MISMO camino -- un verificador que
+# no puede certificar integridad no es evidencia de que todo este bien,
+# es evidencia de que no se puede saber. Fail-closed, mismo principio que
+# el resto del sistema (state ilegible, sombra ausente, presupuesto
+# corrupto, etc. ya bloqueaban en vez de asumir que todo esta OK).
+if [ "$INTEGRITY_RC" -eq 3 ] || [ "$INTEGRITY_RC" -eq 1 ]; then
+  if [ "$INTEGRITY_RC" -eq 3 ]; then
+    INTEGRITY_KIND="divergencia archivo-vs-sombra detectada"
+    INTEGRITY_FLAG_REASON="divergencia de integridad archivo-vs-sombra"
+  else
+    INTEGRITY_KIND="verificador de integridad ilegible o con error interno (rc=1)"
+    INTEGRITY_FLAG_REASON="verificador de integridad ilegible"
+  fi
+  printf -- "- %s INTEGRIDAD | %s | ver %s | launchd descargado, aperturas bloqueadas -- revision manual requerida\n" \
+    "$(date +"%Y-%m-%d %H:%M %z")" "$INTEGRITY_KIND" "$INTEGRITY_LOG" >> state/journal.md
   # Mismo mecanismo que ya bloquea aperturas tras una corrida abortada
   # (WP2, ver mas arriba) -- reconcile.py --done exige revision manual
   # antes de poder borrar este flag.
-  printf '{\n  "reason": "divergencia de integridad archivo-vs-sombra",\n  "log": "%s",\n  "at": "%s"\n}\n' \
-    "$INTEGRITY_LOG" "$(date +"%Y-%m-%d %H:%M %z")" > state/.needs_reconciliation
-  osascript -e "display notification \"divergencia de integridad detectada -- corridas reales suspendidas\" with title \"etoro-agent\"" || true
+  printf '{\n  "reason": "%s",\n  "log": "%s",\n  "at": "%s"\n}\n' \
+    "$INTEGRITY_FLAG_REASON" "$INTEGRITY_LOG" "$(date +"%Y-%m-%d %H:%M %z")" > state/.needs_reconciliation
+  osascript -e "display notification \"integridad comprometida -- corridas reales suspendidas\" with title \"etoro-agent\"" || true
   # Kill-switch: descarga ambos jobs de launchd para que no vuelva a
   # correr desatendido. DETACHADO y con una pausa corta a proposito: el
   # runner puede estar corriendo BAJO uno de esos mismos jobs -- si lo
@@ -229,10 +244,6 @@ if [ "$INTEGRITY_RC" -eq 3 ]; then
   # su propio cleanup (trap EXIT, liberacion del lock). El journal de
   # arriba YA quedo escrito antes de disparar esto.
   nohup bash -c 'sleep 2; launchctl unload "$HOME/Library/LaunchAgents/com.etoroagent.equities.plist" "$HOME/Library/LaunchAgents/com.etoroagent.crypto.plist"' >/dev/null 2>&1 &
-elif [ "$INTEGRITY_RC" -eq 1 ]; then
-  echo "WARN: integrity_check.py falló (rc=1) -- ver $INTEGRITY_LOG" >&2
-  printf -- "- %s WARN | integrity_check.py falló, no se detiene la operación | ver %s\n" \
-    "$(date +"%Y-%m-%d %H:%M %z")" "$INTEGRITY_LOG" >> state/journal.md
 fi
 
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"

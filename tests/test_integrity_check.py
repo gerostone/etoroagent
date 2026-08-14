@@ -475,3 +475,27 @@ def test_main_print_peak_nunca_falla_ante_datos_corruptos(tmp_path, capsys):
     )
 
     assert rc == 0
+
+
+# --- WP8b, fix 2: rc=1 (verificador ilegible) -------------------------
+
+
+def test_main_rc1_cuando_el_archivo_es_irrecuperable(tmp_path):
+    # Ambos lados deben EXISTIR simétricamente para que check_equity
+    # llegue a leer el CONTENIDO del archivo (si solo uno existiera, se
+    # detecta como ausencia asimétrica -- una divergencia real, rc=3 --
+    # antes de intentar leer nada). Con permiso 000 sobre el archivo de
+    # equity, la lectura de su contenido lanza PermissionError, no
+    # capturada dentro de check() -- exit 1, nunca una divergencia real.
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-01", 1000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 1000.0)])
+    equity_path = state_dir / "equity.csv"
+    equity_path.chmod(0o000)
+
+    try:
+        rc = integrity_check.main(["--state-dir", str(state_dir), "--shadow-dir", str(shadow_dir)])
+        assert rc == 1
+    finally:
+        equity_path.chmod(0o644)

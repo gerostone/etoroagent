@@ -443,6 +443,98 @@ def test_compuesto_de_dos_sustituciones_coordinadas_es_detectado_por_monotonia(t
                 pass
 
 
+def test_verificador_ilegible_rc1_ejecuta_el_mismo_camino_de_freno(tmp_path):
+    # WP8b, fix 2: un fallo interno del propio verificador (rc=1) ya no
+    # se journalea como un WARN inocuo -- frena por el MISMO camino que
+    # una divergencia real (rc=3). Simula "archivo corrupto irrecuperable"
+    # con permiso 000 sobre el archivo REAL de equity: ni
+    # scripts/shadow_sync.py (best-effort, sigue de largo con un WARN,
+    # sin relación con este fix) ni scripts/integrity_check.py pueden
+    # leerlo -- pero integrity_check.py ahora sí debe frenar la corrida.
+    equity_backup = _backup(EQUITY_CSV)
+    budget_backup = _backup(RUN_ORDERS_JSON)
+    journal_backup = _backup(JOURNAL)
+    recon_backup = _backup(NEEDS_RECONCILIATION)
+    original_mode = EQUITY_CSV.stat().st_mode if EQUITY_CSV.exists() else None
+    result = None
+
+    try:
+        assert EQUITY_CSV.exists(), "se necesita un state/equity.csv real para este test"
+
+        home_dir = tmp_path / "home"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "launchctl_calls.txt"
+        _fake_launchctl_stub(bin_dir, marker)
+
+        # Claude exitoso y sin efecto (no toca equity.csv) -- aísla este
+        # test del camino de ABORTADA (WP2), que también escribe el flag
+        # de reconciliación y confundiría la aserción de abajo.
+        fake_claude = tmp_path / "fake_claude.sh"
+        fake_claude.write_text("#!/bin/bash\nexit 0\n")
+        fake_claude.chmod(0o755)
+
+        # Pre-siembra la sombra (bajo HOME redirigido) para que exista
+        # ANTES de correr runner.sh -- si dependiera del sync PRE-corrida,
+        # ese sync también fallaría al intentar leer el archivo real ya
+        # corrupto (permiso 000, ver abajo) y la sombra quedaría ausente,
+        # lo que haría que check_equity viera una AUSENCIA ASIMÉTRICA
+        # (divergencia real, rc=3) en vez de llegar a leer el contenido
+        # del archivo corrupto (rc=1, lo que este test quiere ejercitar).
+        shadow_dir = home_dir / "Library" / "Application Support" / "etoroagent"
+        shadow_dir.mkdir(parents=True)
+        (shadow_dir / "equity-shadow.csv").write_text("date,total\n2026-08-01,1000.0\n")
+        (shadow_dir / "run-orders-shadow.json").write_text(
+            '{"runId": null, "count": 0, "date": null, "dailyCount": 0}'
+        )
+
+        EQUITY_CSV.chmod(0o000)
+
+        result = _run_runner(
+            "crypto",
+            {
+                "CLAUDE_BIN": str(fake_claude),
+                "DRY_RUN": "1",
+                "HOME": str(home_dir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        journal_text = JOURNAL.read_text()
+        assert "INTEGRIDAD" in journal_text
+        assert "ilegible" in journal_text.lower() or "error interno" in journal_text.lower()
+
+        assert NEEDS_RECONCILIATION.exists()
+        flag_data = json.loads(NEEDS_RECONCILIATION.read_text())
+        assert "ilegible" in flag_data["reason"].lower()
+
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.5)
+        assert marker.exists(), "el kill-switch no invocó el launchctl stub a tiempo"
+    finally:
+        if original_mode is not None:
+            EQUITY_CSV.chmod(original_mode)
+        _restore(EQUITY_CSV, equity_backup)
+        _restore(RUN_ORDERS_JSON, budget_backup)
+        _restore(JOURNAL, journal_backup)
+        _restore(NEEDS_RECONCILIATION, recon_backup)
+        if result is not None:
+            _cleanup_report_log(result.stdout)
+        for stray_log in (ROOT / "reports").glob("*-crypto-integrity.log"):
+            stray_log.unlink()
+        pidfile = LOCK_DIR / "pid"
+        if pidfile.exists():
+            pidfile.unlink()
+        if LOCK_DIR.exists():
+            try:
+                LOCK_DIR.rmdir()
+            except OSError:
+                pass
+
+
 def test_integridad_intacta_no_journalea_ni_dispara_killswitch(real_state_backup, tmp_path):
     # Control negativo: una corrida normal (sin divergencia) no debe
     # journalear INTEGRIDAD ni tocar el flag de reconciliación.

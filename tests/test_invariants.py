@@ -26,6 +26,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import place_order  # noqa: E402
+import integrity_check  # noqa: E402
 from risk import OrderRequest, validate  # noqa: E402
 
 
@@ -864,3 +865,73 @@ def test_divergencia_de_integridad_no_afecta_closes(
     else:
         client.close_position.assert_not_called()
         assert "DRY_RUN" in journal
+
+
+# ============================================================================
+# Invariante 14 (WP8b): el compuesto de dos fuentes envenenadas en
+# sincronía es detectado si el pico bajó respecto de la memoria
+# pre-corrida.
+# ============================================================================
+#
+# Garantía: check_equity/check_budget (scripts/integrity_check.py)
+# comparan archivo contra sombra -- un compuesto de dos sustituciones
+# coordinadas que reescriben AMBOS lados al MISMO valor más bajo no
+# dispara ninguna de las dos comparaciones (archivo y sombra siguen "de
+# acuerdo" entre sí, por construcción). check_peak_monotonicity compara
+# contra un tercer valor que ningún archivo puede envenenar: el pico
+# retenido en memoria del proceso del runner ANTES de que corriera nada.
+# Para cualquier par (pico en memoria, pico envenenado en sincronía), la
+# divergencia se detecta si y solo si el pico envenenado cayó más allá
+# de la tolerancia respecto del pico en memoria -- sin importar que
+# archivo y sombra coincidan exactamente entre sí.
+
+
+@pytest.mark.parametrize(
+    "memory_peak, poisoned_peak, expect_divergence",
+    [
+        (10000.0, 8000.0, True),  # vector exacto del auditor
+        (10000.0, 10050.0, False),  # crecimiento legítimo del pico
+        (10000.0, 9999.0, False),  # dentro de la tolerancia de redondeo
+        (10000.0, 9900.0, True),  # justo fuera de la tolerancia
+        (100.0, 1.0, True),
+        (100.0, 100.0, False),  # sin envenenamiento: pico sin cambios
+    ],
+    ids=[
+        "vector_del_auditor_10000_a_8000",
+        "crecimiento_legitimo",
+        "dentro_de_tolerancia",
+        "fuera_de_tolerancia",
+        "escala_chica",
+        "sin_cambios",
+    ],
+)
+def test_compuesto_envenenado_en_sincronia_detectado_por_memoria_pre_corrida(
+    tmp_path, memory_peak, poisoned_peak, expect_divergence
+):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    # Archivo y sombra "envenenados" EN SINCRONÍA -- exactamente el mismo
+    # valor en ambos lados, simulando el compuesto de dos sustituciones
+    # coordinadas que se pusieron de acuerdo entre sí.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "equity.csv").write_text(f"date,total\n2026-08-14,{poisoned_peak}\n")
+    (shadow_dir / "equity-shadow.csv").write_text(f"date,total\n2026-08-14,{poisoned_peak}\n")
+
+    # Control: comparando SOLO archivo vs sombra (sin la memoria
+    # pre-corrida), nunca hay divergencia -- por construcción, son
+    # idénticos. Confirma que el compuesto realmente evade esa pieza.
+    assert integrity_check.check_equity(state_dir, shadow_dir) is None
+
+    divergencias = integrity_check.check(state_dir, shadow_dir, expected_peak=memory_peak)
+
+    if expect_divergence:
+        assert divergencias, (
+            f"se esperaba divergencia: memoria={memory_peak}, envenenado={poisoned_peak}"
+        )
+        assert any("monoton" in d.lower() for d in divergencias)
+    else:
+        assert divergencias == [], (
+            f"no se esperaba divergencia: memoria={memory_peak}, envenenado={poisoned_peak} "
+            f"-- {divergencias}"
+        )
