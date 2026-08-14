@@ -65,6 +65,13 @@ def candles_resp(close, from_date=None):
     }
 
 
+# -- WP7: modo real listo por default (fixture compartido, ver tests/conftest.py) --
+#
+# El autouse fixture `_wp7_modo_real_listo_por_default` vive en
+# tests/conftest.py (aplica a toda la suite, no solo a este archivo) --
+# ver su docstring ahí para el porqué completo.
+
+
 # -- 1: excede 25% de posición --------------------------------------------
 
 
@@ -1603,3 +1610,511 @@ def test_sin_env_ni_kwarg_usa_state_dir_default_del_modulo(tmp_path, monkeypatch
 
     assert rc == 0
     assert (fallback_dir / "journal.md").exists()
+
+
+# ============================================================================
+# WP7: el candado final para habilitar DRY_RUN=0 desatendido.
+# ============================================================================
+#
+# Piezas 1 (reconstrucción de estado desde la API en modo real), 2 (sombra
+# de integridad fuera del repo) y 3 (autorización de corridas reales).
+# Todos los tests de esta sección marcados @pytest.mark.wp7_real optan
+# afuera del stub por default de _reconstruct_state_from_api/_load_shadow
+# (ver tests/conftest.py) para ejercitar la lógica REAL.
+
+
+def _client_factory_no_debe_invocarse():
+    raise AssertionError(
+        "make_client no debía invocarse: el bloqueo tenía que ocurrir antes "
+        "de tocar el cliente HTTP"
+    )
+
+
+def _wp7_search_instrument_side_effect(symbol_to_instrument: dict):
+    def _side_effect(query_symbol):
+        if query_symbol in symbol_to_instrument:
+            return {
+                "items": [
+                    {
+                        "internalInstrumentId": symbol_to_instrument[query_symbol],
+                        "internalSymbolFull": query_symbol,
+                        "isHiddenFromClient": False,
+                    }
+                ]
+            }
+        return {"items": []}
+
+    return _side_effect
+
+
+def _wp7_pnl_response(cash: float, positions: list) -> dict:
+    """positions: lista de (symbol_ignorado_aca, instrument_id, amount) --
+    el símbolo real lo resuelve build_state() vía symbol_by_id, no hace
+    falta acá (se conserva en la tupla solo para legibilidad del test)."""
+    return {
+        "clientPortfolio": {
+            "credit": cash,
+            "positions": [
+                {
+                    "positionID": f"pos-{i}",
+                    "instrumentID": instrument_id,
+                    "amount": amount,
+                    "unrealizedPnL": 0,
+                }
+                for i, (_symbol, instrument_id, amount) in enumerate(positions)
+            ],
+            "ordersForOpen": [],
+            "orders": [],
+            "mirrors": [],
+        }
+    }
+
+
+def _wp7_client(cash: float, positions: list, symbol_to_instrument: dict, price: float = 100.0):
+    """Cliente mockeado completo para tests @wp7_real: get_pnl() +
+    search_instrument() (para la resolución de universo que hace
+    snapshot._resolve_universe_symbol_by_id) + get_candles() +
+    open_position_by_amount()."""
+    client = MagicMock()
+    client.search_instrument.side_effect = _wp7_search_instrument_side_effect(symbol_to_instrument)
+    client.get_pnl.return_value = _wp7_pnl_response(cash, positions)
+    client.get_candles.return_value = candles_resp(price)
+    client.open_position_by_amount.return_value = {"positionID": "new-1"}
+    return client
+
+
+def _write_shadow(shadow_dir: Path, equity_rows: list, budget: dict) -> None:
+    shadow_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["date,total"] + [f"{date},{value}" for date, value in equity_rows]
+    (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("\n".join(lines) + "\n")
+    (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text(json.dumps(budget))
+
+
+# -- Pieza 1: reconstrucción de estado desde la API en vivo -----------------
+
+
+def _stub_shadow_neutral(monkeypatch):
+    """@pytest.mark.wp7_real opta afuera de AMBOS stubs por default
+    (reconstrucción Y sombra, ver tests/conftest.py) -- los tests de esta
+    sub-sección ejercitan SOLO la pieza 1 (reconstrucción real) y no les
+    interesa la pieza 2 (sombra), así que reponen el stub neutro de
+    _load_shadow acá para no toparse con el gate de sombra ausente."""
+    monkeypatch.setattr(
+        place_order,
+        "_load_shadow",
+        lambda shadow_dir: {"equity_rows": [], "budget": None},
+    )
+
+
+@pytest.mark.wp7_real
+def test_wp7_reconstruccion_usa_estado_vivo_no_el_archivo(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    # El ARCHIVO dice casi sin cash y con una posición QQQ existente (que
+    # bloquearía por no-duplicación) -- pero la API en vivo dice que el
+    # portfolio real está vacío y con cash de sobra. La reconstrucción
+    # debe validar contra la API, no contra el archivo desactualizado.
+    stale_state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1.0,
+        "positions": [{"positionId": "pos-9", "symbol": "QQQ", "instrumentId": 7, "valueUsd": 999.0}],
+    }
+    state_dir = write_state(tmp_path, stale_state, EQUITY_ROWS_BASIC)
+    client = _wp7_client(cash=1000.0, positions=[], symbol_to_instrument={"SPY": 1})
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+@pytest.mark.wp7_real
+def test_wp7_reconstruccion_bloquea_no_dup_con_posicion_real_solo_visible_en_api(
+    tmp_path, monkeypatch
+):
+    # Inverso del anterior: el ARCHIVO no tiene ninguna posición, pero la
+    # API en vivo sí tiene QQQ -- debe bloquear por no-duplicación igual,
+    # porque valida contra la API, no contra el archivo.
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    state_dir = write_state(tmp_path, STATE_BASIC_SIN_POSICIONES(), EQUITY_ROWS_BASIC)
+    client = _wp7_client(cash=1000.0, positions=[("QQQ", 7, 200.0)], symbol_to_instrument={"QQQ": 7})
+
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "no-duplicaci" in journal.lower()
+    client.open_position_by_amount.assert_not_called()
+
+
+@pytest.mark.wp7_real
+def test_wp7_get_pnl_falla_exit1_sin_operar(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.get_pnl.side_effect = RuntimeError("API caída")
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 1
+    client.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "ERROR" in journal
+    assert "reconstruir" in journal.lower()
+
+
+@pytest.mark.wp7_real
+def test_wp7_instrumentid_no_resoluble_exit1_sin_operar(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.search_instrument.return_value = {"items": []}  # nada resuelve nunca
+    client.get_pnl.return_value = {
+        "clientPortfolio": {
+            "credit": 1000.0,
+            "positions": [
+                {"positionID": "p1", "instrumentID": 999999, "amount": 10.0, "unrealizedPnL": 0}
+            ],
+            "ordersForOpen": [],
+            "orders": [],
+            "mirrors": [],
+        }
+    }
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 1
+    client.open_position_by_amount.assert_not_called()
+    journal = (state_dir / "journal.md").read_text()
+    assert "ERROR" in journal
+
+
+@pytest.mark.wp7_real
+def test_wp7_merge_local_open_reciente_bloquea_recompra_por_no_dup(tmp_path, monkeypatch):
+    # get_pnl() cachea 60s del lado de eToro: puede no reflejar todavía
+    # una apertura de ESTA misma corrida. La entrada local-open:* reciente
+    # debe mergearse encima del estado reconstruido y seguir bloqueando
+    # la recompra por no-duplicación, aunque la API "en vivo" diga que el
+    # portfolio está vacío.
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 500.0,
+        "positions": [
+            {
+                "positionId": "local-open:abc",
+                "symbol": "QQQ",
+                "instrumentId": 7,
+                "valueUsd": 200.0,
+                "pending": True,
+                "localOpenAt": _fresh_updated_at(),
+            }
+        ],
+    }
+    state_dir = write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = _wp7_client(cash=1000.0, positions=[], symbol_to_instrument={"QQQ": 7})
+
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "50", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "no-duplicaci" in journal.lower()
+    client.open_position_by_amount.assert_not_called()
+
+
+@pytest.mark.wp7_real
+def test_wp7_merge_local_open_viejo_fuera_de_ventana_no_se_mergea(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    _stub_shadow_neutral(monkeypatch)
+    old_ts = (
+        datetime.now(timezone.utc)
+        - timedelta(minutes=place_order.LOCAL_OPEN_MERGE_WINDOW_MINUTES + 5)
+    ).isoformat()
+    state = {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 500.0,
+        "positions": [
+            {
+                "positionId": "local-open:old",
+                "symbol": "QQQ",
+                "instrumentId": 7,
+                "valueUsd": 200.0,
+                "pending": True,
+                "localOpenAt": old_ts,
+            }
+        ],
+    }
+    state_dir = write_state(tmp_path, state, EQUITY_ROWS_BASIC)
+    client = _wp7_client(cash=1000.0, positions=[], symbol_to_instrument={"QQQ": 7})
+
+    rc = place_order.main(
+        ["open", "--symbol", "QQQ", "--amount", "50", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+# -- Pieza 2: sombra de integridad fuera del repo ----------------------------
+
+
+@pytest.mark.wp7_real
+def test_wp7_sombra_ausente_bloquea_open_sin_llamar_cliente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    shadow_dir = tmp_path / "no-existe-sombra"
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=_client_factory_no_debe_invocarse,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "sombra" in journal.lower()
+
+
+@pytest.mark.wp7_real
+def test_wp7_sombra_corrupta_bloquea_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    shadow_dir = tmp_path / "sombra"
+    shadow_dir.mkdir()
+    (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("date,total\n2026-08-01,1000.0\n")
+    (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text("{esto no es json")
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=_client_factory_no_debe_invocarse,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "sombra" in journal.lower()
+
+
+@pytest.mark.wp7_real
+def test_wp7_close_inmune_a_sombra_ausente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    shadow_dir = tmp_path / "no-existe-sombra"
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "QQQ"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.close_position.assert_called_once()
+
+
+@pytest.mark.wp7_real
+def test_wp7_sombra_equity_peak_detecta_drawdown_pese_a_archivo_truncado(tmp_path, monkeypatch):
+    # Archivo de equity truncado/sustituido: una sola fila reciente y
+    # baja, sin historia -- ningún drawdown visible si solo se mirara el
+    # archivo. La sombra retiene el pico real (1000): (1000-700)/1000 =
+    # 30% >= 25% -> modo defensivo, bloquea la apertura.
+    monkeypatch.setenv("DRY_RUN", "0")
+    truncated_equity = [("2026-08-13", 700.0)]
+    state_dir = write_state(tmp_path, STATE_BASIC, truncated_equity)
+    shadow_dir = tmp_path / "sombra"
+    _write_shadow(
+        shadow_dir,
+        equity_rows=[("2026-08-01", 1000.0), ("2026-08-05", 950.0)],
+        budget={"runId": None, "count": 0, "date": None, "dailyCount": 0},
+    )
+    client = _wp7_client(cash=1000.0, positions=[], symbol_to_instrument={"SPY": 1})
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "defensivo" in journal.lower()
+    client.open_position_by_amount.assert_not_called()
+
+
+@pytest.mark.wp7_real
+def test_wp7_sombra_presupuesto_detecta_reset_del_archivo(tmp_path, monkeypatch):
+    # state/.run_orders.json fue "reseteado" (borrado/sustituido, nunca
+    # escrito en este tmp_path): el archivo por sí solo reportaría
+    # presupuesto fresco (0/0). La sombra retiene el conteo real (ya
+    # agotado, MISMO runId/fecha) -- el presupuesto EFECTIVO sigue
+    # agotado.
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-x")
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    shadow_dir = tmp_path / "sombra"
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    _write_shadow(
+        shadow_dir,
+        equity_rows=[("2026-08-01", 1000.0)],
+        budget={
+            "runId": "run-x",
+            "count": place_order.MAX_ORDERS_PER_RUN,
+            "date": today,
+            "dailyCount": place_order.MAX_ORDERS_PER_RUN,
+        },
+    )
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=_client_factory_no_debe_invocarse,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "tope" in journal.lower() or "presupuesto" in journal.lower()
+
+
+@pytest.mark.wp7_real
+def test_wp7_sombra_no_eleva_presupuesto_de_contexto_distinto(tmp_path, monkeypatch):
+    # Control negativo: si la sombra pertenece a un runId/fecha DISTINTO
+    # del actual, su conteo no debe pisar el presupuesto fresco de la
+    # corrida/día actual -- un contexto nuevo legítimamente arranca en 0.
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-nuevo")
+    state_dir = write_state(tmp_path, STATE_BASIC_SIN_POSICIONES(), EQUITY_ROWS_BASIC)
+    shadow_dir = tmp_path / "sombra"
+    _write_shadow(
+        shadow_dir,
+        equity_rows=[("2026-08-01", 1000.0)],
+        budget={
+            "runId": "run-viejo",
+            "count": place_order.MAX_ORDERS_PER_RUN,
+            "date": "2020-01-01",
+            "dailyCount": place_order.MAX_ORDERS_PER_RUN,
+        },
+    )
+    client = _wp7_client(cash=1000.0, positions=[], symbol_to_instrument={"SPY": 1})
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+# -- Pieza 3: autorización de corridas reales --------------------------------
+
+
+def test_wp7_authorized_run_ausente_bloquea_open_sin_llamar_cliente(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_AUTHORIZED_RUN", raising=False)
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=_client_factory_no_debe_invocarse,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "autoriza" in journal.lower()
+
+
+def test_wp7_authorized_run_distinto_de_1_bloquea_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_AUTHORIZED_RUN", "true")  # cualquier cosa != "1"
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=_client_factory_no_debe_invocarse,
+    )
+
+    assert rc == 2
+
+
+def test_wp7_authorized_run_ausente_close_pasa(tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_AUTHORIZED_RUN", raising=False)
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+
+    rc = place_order.main(
+        ["close", "--position-id", "pos-9", "--symbol", "QQQ"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.close_position.assert_called_once()
+
+
+def test_wp7_authorized_run_presente_habilita_open(tmp_path, monkeypatch):
+    # Control positivo explícito (más allá de que el autouse fixture ya
+    # lo setee) -- confirma que "1" efectivamente abre la puerta, no solo
+    # que algo-no-vacío lo hace.
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_AUTHORIZED_RUN", "1")
+    state_dir = write_state(tmp_path, STATE_BASIC, EQUITY_ROWS_BASIC)
+    client = _mock_client_for("SPY", 1)
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "20", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.open_position_by_amount.assert_called_once()
+
+
+def STATE_BASIC_SIN_POSICIONES():
+    return {
+        "updatedAt": _fresh_updated_at(),
+        "portfolioId": "pf-1",
+        "cashUsd": 1000.0,
+        "positions": [],
+    }

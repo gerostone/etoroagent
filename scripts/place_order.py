@@ -106,6 +106,43 @@ siempre, sin excepción:
 Toda decisión (ejecutada, bloqueada, dry-run, ambigua, error) se journalea en
 state/journal.md con timestamp en hora local con offset y la razón pasada
 por --reason.
+
+WP7 (re-auditoría, cierre de la clase residual de sustitución de state/
+SIN nombrar archivos -- rm -rf state/, cp -r otro/. state/ -- que el
+default-deny por mención del hook (WP6/N11) no puede cerrar porque nunca
+menciona ningún nombre de archivo protegido): en modo REAL (DRY_RUN=="0")
+y solo para aperturas, se agregan tres candados nuevos:
+
+  18. Reconstrucción de estado desde la API en vivo (pieza 1): antes de
+      validar, se reconstruye el estado (posiciones + cash) desde
+      client.get_pnl() -- reutilizando snapshot.py (resolución de
+      símbolos + build_state) en vez de duplicar esa lógica -- en lugar
+      de leer state/positions.json. Las entradas locales `local-open:*`
+      RECIENTES (ver _recent_local_open_positions) del archivo en disco
+      se mergean encima, sumando exposición nunca restando (get_pnl()
+      cachea 60s del lado de eToro y puede no reflejar aún una apertura
+      de esta misma corrida). Si get_pnl() falla o algún instrumentID no
+      resuelve, se journalea ERROR y se aborta sin operar (exit 1,
+      fail-closed) -- ver _reconstruct_state_from_api. En DRY_RUN la
+      validación sigue siendo file-based, como siempre.
+  19. Sombra de integridad fuera del repo (pieza 2): scripts/runner.sh
+      sincroniza (antes/después de cada corrida real) state/equity.csv y
+      state/.run_orders.json hacia un directorio sombra fuera del repo
+      ($HOME/Library/Application Support/etoroagent -- ver
+      _default_shadow_dir), con merge append-only que nunca sincroniza
+      hacia abajo. En modo real, el pico usado para el drawdown es el MAX
+      entre state/equity.csv y la sombra (ver
+      _augment_equity_rows_with_shadow_floor), y el presupuesto de
+      órdenes efectivo es el MAX de contadores entre el archivo y la
+      sombra (ver _check_order_budget). Sombra ausente/ilegible en modo
+      real bloquea toda apertura (exit 2) -- los cierres son inmunes.
+  20. Autorización de corridas reales (pieza 3): una apertura en modo
+      real exige ETOROAGENT_AUTHORIZED_RUN=="1" en el entorno -- lo
+      exporta scripts/runner.sh (la única vía de lanzamiento sancionada),
+      nunca el agente. Sin ella, exit 2 ("corrida real no autorizada").
+      Los cierres siguen permitidos siempre (dirección fail-safe, belt
+      and suspenders del lado determinista con el mismo criterio que ya
+      regía para el presupuesto y la reconciliación).
 """
 import argparse
 import csv
@@ -124,6 +161,7 @@ from etoro_api import (  # noqa: E402
     extract_exact_match,
 )
 from risk import CRYPTO_SEARCH_VARIANTS, OrderRequest, validate  # noqa: E402
+import snapshot  # noqa: E402
 
 STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 POSITIONS_FILE = "positions.json"
@@ -147,6 +185,38 @@ STATE_MAX_AGE_HOURS = 24
 #   "local-open:"     -> exposición registrada localmente por este script tras un
 #                         open exitoso o ambiguo (ver regla 8), hasta el próximo snapshot.
 SYNTHETIC_POSITION_PREFIXES = ("pending-open:", "local-open:")
+
+# WP7: mismo criterio que risk._is_finite_number / snapshot._is_finite_number
+# -- duplicado a propósito (2 líneas, sin red/estado compartido) en vez de
+# importar un símbolo privado de otro módulo para esto.
+def _is_finite_number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+# -- WP7: sombra de integridad fuera del repo (pieza 2) ----------------------
+#
+# Re-auditoría: el default-deny por mención del hook (WP6/N11) protege
+# state/.run_orders.json, state/.needs_reconciliation, state/positions.json
+# y state/equity.csv -- pero SOLO si el comando MENCIONA alguno de esos
+# nombres. `rm -rf state/` o `cp -r otro-dir/. state/` sustituyen TODO el
+# directorio sin nombrar ningún archivo individual: bypass estructural que
+# ningún mecanismo basado en texto puede cerrar. La sombra vive FUERA del
+# repo (y de state/), en un directorio que esas dos operaciones nunca
+# tocan, y guarda una copia append-only (nunca hacia abajo) de los dos
+# archivos cuya reescritura silenciosa relajaría los límites duros: la
+# curva de equity (pico de drawdown) y el presupuesto de órdenes.
+# scripts/shadow_sync.py (invocado por runner.sh, nunca por el agente) es
+# quien la escribe -- ver su docstring para el algoritmo de merge exacto.
+EQUITY_SHADOW_FILE = "equity-shadow.csv"
+RUN_ORDERS_SHADOW_FILE = "run-orders-shadow.json"
+
+# WP7: ventana de "reciente" para mergear entradas local-open:* del state
+# en disco encima del estado reconstruido desde la API (pieza 1) -- ver
+# _recent_local_open_positions. get_pnl() cachea 60s del lado de eToro;
+# 10 minutos da margen de sobra para una corrida típica sin arrastrar
+# exposición local indefinidamente (una vez que el próximo snapshot.py
+# real la confirme, ya no hace falta el merge).
+LOCAL_OPEN_MERGE_WINDOW_MINUTES = 10
 
 
 # -- State / journal (I/O puro y fino) -------------------------------------
@@ -341,17 +411,32 @@ def _save_order_budget(state_dir: Path, budget: dict) -> None:
     _atomic_write_json(state_dir / ORDER_BUDGET_FILE, budget)
 
 
-def _check_order_budget(state_dir: Path) -> str:
+def _check_order_budget(state_dir: Path, shadow_budget: dict = None) -> str:
     """Solo lectura: no incrementa ni persiste nada (eso es
     _consume_order_budget, llamado recién cuando una orden se ejecuta de
     verdad). Devuelve un mensaje de bloqueo si el presupuesto por corrida,
     el diario, o el archivo mismo (WP4/N3a: corrupto/ilegible ->
     fail-closed) está agotado/inválido, o "" si hay presupuesto
-    disponible."""
+    disponible.
+
+    WP7/pieza 2: shadow_budget (dict crudo de
+    state/../run-orders-shadow.json, o None si no aplica -- modo dry-run,
+    o el caller no cargó sombra) se normaliza con el MISMO criterio de
+    reset por runId/date que el archivo real (_normalize_order_budget), y
+    el presupuesto EFECTIVO usado para los topes es el MAX contador a
+    contador entre archivo y sombra -- un state/.run_orders.json
+    sustituido/borrado (rm -rf state/, cp -r .../. state/) no puede bajar
+    el presupuesto ya consumido si la sombra retuvo el conteo real. Sin
+    sombra (dry-run, o ninguna pasada), el comportamiento es idéntico al
+    de antes de WP7. Cualquier forma inesperada en shadow_budget se
+    ignora (no eleva el piso, pero tampoco bloquea la ruta normal
+    file-based -- la sombra ya fue validada como JSON bien formado por
+    _load_shadow antes de llegar acá; esto es una defensa adicional)."""
     run_id = _effective_run_id()
+    today = _today_local()
     try:
-        budget = _normalize_order_budget(
-            _load_order_budget(state_dir), run_id, _today_local()
+        file_budget = _normalize_order_budget(
+            _load_order_budget(state_dir), run_id, today
         )
     except _OrderBudgetCorruptError as exc:
         return (
@@ -359,9 +444,28 @@ def _check_order_budget(state_dir: Path) -> str:
             f"borr\u00e1 {ORDER_BUDGET_FILE} ({exc})"
         )
 
-    if budget["count"] >= MAX_ORDERS_PER_RUN:
+    effective = file_budget
+    if shadow_budget is not None:
+        try:
+            normalized_shadow = _normalize_order_budget(shadow_budget, run_id, today)
+            shadow_count = normalized_shadow["count"]
+            shadow_daily = normalized_shadow["dailyCount"]
+            if (
+                isinstance(shadow_count, int)
+                and not isinstance(shadow_count, bool)
+                and isinstance(shadow_daily, int)
+                and not isinstance(shadow_daily, bool)
+            ):
+                effective = {
+                    "count": max(file_budget["count"], shadow_count),
+                    "dailyCount": max(file_budget["dailyCount"], shadow_daily),
+                }
+        except Exception:
+            pass
+
+    if effective["count"] >= MAX_ORDERS_PER_RUN:
         return f"tope de {MAX_ORDERS_PER_RUN} órdenes por corrida alcanzado"
-    if budget["dailyCount"] >= MAX_ORDERS_PER_DAY:
+    if effective["dailyCount"] >= MAX_ORDERS_PER_DAY:
         return f"presupuesto diario de {MAX_ORDERS_PER_DAY} órdenes agotado"
     return ""
 
@@ -415,6 +519,11 @@ def _register_local_exposure(
             "instrumentId": instrument_id,
             "valueUsd": amount,
             "pending": True,
+            # WP7/pieza 1: timestamp de creación -- _recent_local_open_positions
+            # lo usa para decidir si esta entrada es lo bastante reciente como
+            # para mergearla encima del estado reconstruido desde la API en
+            # modo real (get_pnl() cachea 60s del lado de eToro).
+            "localOpenAt": datetime.now(timezone.utc).isoformat(),
         }
     ]
     new_state["cashUsd"] = state["cashUsd"] - amount
@@ -487,6 +596,141 @@ def _is_dry_run() -> bool:
 
 def _is_finite_positive(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
+# -- WP7/pieza 2: lectura de la sombra de integridad -------------------------
+
+
+def _default_shadow_dir() -> Path:
+    """Directorio sombra fuera del repo: $HOME/Library/Application
+    Support/etoroagent. Path.home() respeta la env var HOME (vía
+    os.path.expanduser) -- los tests de integración (runner.sh,
+    subprocess) redirigen HOME a un tmp_path para no tocar el directorio
+    real del operador; los tests a nivel de main()/place_order.py pueden
+    en cambio pasar el kwarg shadow_dir= directamente."""
+    return Path.home() / "Library" / "Application Support" / "etoroagent"
+
+
+class _ShadowIntegrityError(Exception):
+    """WP7: la sombra de integridad (equity-shadow.csv y
+    run-orders-shadow.json, ver _default_shadow_dir) está ausente o es
+    ilegible en modo real. scripts/shadow_sync.py (invocado por
+    runner.sh antes/después de cada corrida real) es quien la mantiene
+    -- su ausencia significa que esta invocación no pasó por runner.sh, o
+    que el directorio sombra fue borrado/corrompido. Fail-closed: bloquea
+    aperturas (los cierres son inmunes, ver main())."""
+
+
+def _load_shadow(shadow_dir: Path) -> dict:
+    """Lee equity-shadow.csv y run-orders-shadow.json de shadow_dir.
+    AMBOS deben existir y ser legibles -- ausencia o corrupción de
+    cualquiera de los dos lanza _ShadowIntegrityError (fail-closed).
+    Devuelve {"equity_rows": [(fecha, valor), ...], "budget": dict}."""
+    equity_path = shadow_dir / EQUITY_SHADOW_FILE
+    budget_path = shadow_dir / RUN_ORDERS_SHADOW_FILE
+
+    if not equity_path.exists():
+        raise _ShadowIntegrityError(f"falta {equity_path}")
+    if not budget_path.exists():
+        raise _ShadowIntegrityError(f"falta {budget_path}")
+
+    try:
+        equity_rows = _read_equity_rows(equity_path)
+    except (ValueError, OSError) as exc:
+        raise _ShadowIntegrityError(f"{equity_path} corrupto/ilegible: {exc}") from exc
+
+    try:
+        with open(budget_path) as f:
+            budget = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise _ShadowIntegrityError(f"{budget_path} corrupto/ilegible: {exc}") from exc
+    if not isinstance(budget, dict):
+        raise _ShadowIntegrityError(f"{budget_path} no es un objeto JSON válido: {budget!r}")
+
+    return {"equity_rows": equity_rows, "budget": budget}
+
+
+def _augment_equity_rows_with_shadow_floor(equity_rows: list, shadow_equity_rows: list) -> list:
+    """WP7/pieza 2: el pico usado por risk.drawdown_pct() (dentro de
+    validate()) no puede ser menor al pico visto históricamente en la
+    sombra de equity -- un state/equity.csv truncado/sustituido no puede
+    ocultar un drawdown real. Antepone (nunca agrega al final) una fila
+    SINTÉTICA con el pico de la sombra, solo si supera el pico ya
+    presente en equity_rows -- drawdown_pct() calcula el pico como
+    max(valores) y usa la ÚLTIMA fila como valor actual, así que anteponer
+    (en vez de agregar al final) preserva cuál fila cuenta como 'actual'
+    (siempre la más fresca de ESTA corrida, nunca la sombra). Sin
+    equity_rows o sin shadow_equity_rows, no hay nada que aumentar."""
+    if not equity_rows or not shadow_equity_rows:
+        return equity_rows
+    shadow_values = [v for _, v in shadow_equity_rows if _is_finite_number(v)]
+    if not shadow_values:
+        return equity_rows
+    state_values = [v for _, v in equity_rows if _is_finite_number(v)]
+    if not state_values:
+        return equity_rows
+    shadow_peak = max(shadow_values)
+    state_peak = max(state_values)
+    if shadow_peak <= state_peak:
+        return equity_rows
+    return [("__shadow_peak__", shadow_peak)] + list(equity_rows)
+
+
+# -- WP7/pieza 1: reconstrucción de estado desde la API en vivo -------------
+
+
+def _recent_local_open_positions(file_positions: list) -> list:
+    """Entradas local-open:* de state/positions.json EN DISCO cuyo
+    localOpenAt (ver _register_local_exposure) sea reciente -- dentro de
+    LOCAL_OPEN_MERGE_WINDOW_MINUTES. get_pnl() cachea 60s del lado de
+    eToro y puede no reflejar todavía una apertura de esta misma corrida;
+    estas entradas se mergean encima del estado reconstruido desde la API
+    (ver _reconstruct_state_from_api), sumando exposición, nunca
+    restando. Fail-closed: una entrada sin localOpenAt parseable (formato
+    viejo, corrupción) se incluye igual -- mejor sumar de más exposición
+    que perder una real."""
+    recent = []
+    now = datetime.now(timezone.utc)
+    for p in file_positions:
+        position_id = str(p.get("positionId", ""))
+        if not position_id.startswith("local-open:"):
+            continue
+        try:
+            created = _parse_iso_datetime(p.get("localOpenAt"))
+            fresh = (now - created) <= timedelta(minutes=LOCAL_OPEN_MERGE_WINDOW_MINUTES)
+        except ValueError:
+            fresh = True
+        if fresh:
+            recent.append(p)
+    return recent
+
+
+def _reconstruct_state_from_api(client, file_state: dict) -> dict:
+    """WP7/pieza 1: en modo real, el estado que risk.validate() valida
+    para una APERTURA se reconstruye desde la API en vivo
+    (client.get_pnl()), no se lee de state/positions.json -- un archivo
+    sustituido/truncado por fuera del hook (rm -rf state/, cp -r .../.
+    state/, que no mencionan ningún archivo protegido individual) no
+    puede mentirle a la validación de riesgo.
+
+    Reutiliza scripts/snapshot.py (_resolve_universe_symbol_by_id +
+    build_state) para la resolución de símbolos en vez de duplicar esa
+    lógica -- mismo criterio y mismas garantías fail-closed que el
+    snapshot real (instrumentID no resoluble, mirrors no vacío, etc. ->
+    ValueError, propagada tal cual). portfolioId es puramente informativo
+    (ver snapshot.py): se reutiliza el del archivo si estaba, no hace
+    falta un GET adicional a agent-portfolios para esto.
+
+    Fail-closed: cualquier excepción (client.get_pnl(), resolución de
+    símbolos, build_state) se propaga sin capturar -- el caller
+    (_handle_open) la journalea como ERROR y no opera (exit 1)."""
+    pnl = client.get_pnl()
+    symbol_by_id = snapshot._resolve_universe_symbol_by_id(client)
+    fresh_state = snapshot.build_state(file_state.get("portfolioId"), pnl, symbol_by_id)
+    fresh_state["positions"] = list(fresh_state["positions"]) + _recent_local_open_positions(
+        file_state.get("positions", [])
+    )
+    return fresh_state
 
 
 # -- CLI ---------------------------------------------------------------
@@ -576,14 +820,56 @@ def _resolve_current_price(client, instrument_id) -> float:
     return float(price)
 
 
-def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_factory) -> int:
+def _handle_open(
+    args, state: dict, equity_rows: list, state_dir: Path, client_factory, shadow: dict = None
+) -> int:
     symbol = args.symbol.strip().upper()
     amount = args.amount
     order = OrderRequest(
         action="open", symbol=symbol, amount_usd=amount, stop_loss_pct=args.stop_loss_pct
     )
 
-    ok, msg = validate(order, state, equity_rows)
+    effective_state = state
+    effective_equity_rows = equity_rows
+    client = None
+
+    if not _is_dry_run():
+        # WP7: en modo real, el cliente se crea ACÁ (antes de validar), no
+        # más abajo -- hace falta para la reconstrucción de estado desde
+        # la API (pieza 1). Se reutiliza el mismo objeto para el resto del
+        # flujo (resolución de instrumentId, precio, la orden en sí) en
+        # vez de volver a invocar client_factory().
+        try:
+            client = client_factory()
+        except Exception as exc:
+            journal(
+                state_dir,
+                f"ERROR | open {symbol} amount={amount} | no se pudo crear el cliente eToro: "
+                f"{exc} | razon={args.reason}",
+            )
+            print(f"ERROR: no se pudo crear el cliente eToro: {exc}", file=sys.stderr)
+            return 1
+
+        try:
+            effective_state = _reconstruct_state_from_api(client, state)
+        except Exception as exc:
+            journal(
+                state_dir,
+                f"ERROR | open {symbol} amount={amount} | no se pudo reconstruir el estado "
+                f"desde la API en vivo: {exc} | razon={args.reason}",
+            )
+            print(
+                f"ERROR: no se pudo reconstruir el estado desde la API para {symbol}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if shadow and shadow.get("equity_rows"):
+            effective_equity_rows = _augment_equity_rows_with_shadow_floor(
+                equity_rows, shadow["equity_rows"]
+            )
+
+    ok, msg = validate(order, effective_state, effective_equity_rows)
     if not ok:
         journal(
             state_dir,
@@ -592,7 +878,7 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         print(f"BLOQUEADA: {msg}", file=sys.stderr)
         return 2
 
-    cash_usd = state["cashUsd"]
+    cash_usd = effective_state["cashUsd"]
     if amount > cash_usd:
         msg = f"monto {amount} supera el cash disponible ({cash_usd})"
         journal(
@@ -611,17 +897,6 @@ def _handle_open(args, state: dict, equity_rows: list, state_dir: Path, client_f
         print(f"DRY_RUN: no se ejecuta open {symbol} amount={amount}")
         _consume_order_budget(state_dir)
         return 0
-
-    try:
-        client = client_factory()
-    except Exception as exc:
-        journal(
-            state_dir,
-            f"ERROR | open {symbol} amount={amount} | no se pudo crear el cliente eToro: "
-            f"{exc} | razon={args.reason}",
-        )
-        print(f"ERROR: no se pudo crear el cliente eToro: {exc}", file=sys.stderr)
-        return 1
 
     try:
         instrument_id = _resolve_instrument_id(client, symbol)
@@ -792,7 +1067,9 @@ def _handle_close(args, state: dict, state_dir: Path, client_factory) -> int:
     return 0
 
 
-def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
+def main(
+    argv=None, state_dir: Path = None, make_client=make_client, shadow_dir: Path = None
+) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if state_dir is None:
@@ -804,6 +1081,15 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
         # scripts/risk_hook.py (WP4/N4a), no este fallback.
         state_dir = os.environ.get("ETOROAGENT_STATE_DIR") or STATE_DIR
     state_dir = Path(state_dir)
+    # WP7/pieza 2: sin kwarg explícito, la sombra vive en
+    # _default_shadow_dir() ($HOME/Library/Application Support/etoroagent).
+    # A diferencia de ETOROAGENT_STATE_DIR, no hay una env var de override
+    # -- el aislamiento para tests de integración se logra redirigiendo
+    # HOME (ver tests/test_runner.py), no con una variable ETOROAGENT_*
+    # nueva que el hook tendría que aprender a vigilar.
+    if shadow_dir is None:
+        shadow_dir = _default_shadow_dir()
+    shadow_dir = Path(shadow_dir)
 
     args = _build_parser().parse_args(argv)
 
@@ -835,13 +1121,48 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
         return 2
 
     if args.action == "open":
+        real_mode = not _is_dry_run()
+        shadow = None
+
+        if real_mode:
+            # WP7/pieza 3: una apertura en modo real exige que la corrida
+            # haya sido lanzada por scripts/runner.sh (única vía sancionada,
+            # ver PLAYBOOK.md §Autorización de corridas reales) -- se
+            # chequea ANTES de tocar el cliente HTTP o la sombra, el gate
+            # más barato primero. Los cierres NO chequean esto (belt and
+            # suspenders del lado determinista, ver más abajo).
+            if os.environ.get("ETOROAGENT_AUTHORIZED_RUN") != "1":
+                auth_msg = "corrida real no autorizada: lanzar via runner.sh"
+                journal(state_dir, f"BLOQUEADA | open | {auth_msg} | razon={args.reason}")
+                print(f"BLOQUEADA: {auth_msg}", file=sys.stderr)
+                return 2
+
+            # WP7/pieza 2: la sombra de integridad debe existir y ser
+            # legible en modo real -- ausencia o corrupción bloquea toda
+            # apertura (fail-closed). scripts/shadow_sync.py (invocado por
+            # runner.sh) es quien la mantiene; su ausencia es la señal de
+            # que esta invocación no pasó por runner.sh o de que el
+            # directorio sombra fue borrado.
+            try:
+                shadow = _load_shadow(shadow_dir)
+            except _ShadowIntegrityError as exc:
+                shadow_msg = f"sombra de integridad ausente: correr via runner ({exc})"
+                journal(state_dir, f"BLOQUEADA | open | {shadow_msg} | razon={args.reason}")
+                print(f"BLOQUEADA: {shadow_msg}", file=sys.stderr)
+                return 2
+
         # WP4/N1 (re-auditoría, hallazgo CRÍTICO): el presupuesto de órdenes
         # (WP1, docstring regla 15) aplica SOLO a aperturas -- se evalúa ANTES
         # de despachar, para que un bloqueo acá jamás llegue a tocar el
         # cliente HTTP ni, crucialmente, a consumir presupuesto él mismo. Los
         # CIERRES (más abajo) ni lo chequean ni lo consumen: reducir riesgo
-        # nunca debe esperar a que haya "presupuesto" disponible.
-        budget_block_msg = _check_order_budget(state_dir)
+        # nunca debe esperar a que haya "presupuesto" disponible. WP7/pieza
+        # 2: en modo real, el presupuesto efectivo se blende con la sombra
+        # (ver _check_order_budget) -- en dry-run, shadow es None y el
+        # comportamiento es idéntico al de antes de WP7.
+        budget_block_msg = _check_order_budget(
+            state_dir, shadow["budget"] if shadow else None
+        )
         if budget_block_msg:
             journal(
                 state_dir, f"BLOQUEADA | open | {budget_block_msg} | razon={args.reason}"
@@ -864,7 +1185,7 @@ def main(argv=None, state_dir: Path = None, make_client=make_client) -> int:
             print(f"BLOQUEADA: {recon_msg}", file=sys.stderr)
             return 2
 
-        return _handle_open(args, state, equity_rows, state_dir, make_client)
+        return _handle_open(args, state, equity_rows, state_dir, make_client, shadow=shadow)
 
     # Cierres: SIN chequeo de presupuesto y SIN chequeo de reconciliación
     # (WP4/N1, WP2) -- dirección fail-safe, reducir riesgo nunca espera.
