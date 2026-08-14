@@ -18,7 +18,7 @@ piezas se combinan en producción.
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -556,3 +556,203 @@ def test_hook_permite_lecturas_puras_y_journaling_que_no_mencionan_estado_proteg
     ]:
         r = _run_risk_hook(command)
         assert r.returncode == 0, f"{command!r} debia pasar, salio rc={r.returncode}"
+
+
+# ============================================================================
+# Invariante 9 (WP7): en modo real sin autorización, ningún open llega al
+# cliente.
+# ============================================================================
+#
+# Garantía: ETOROAGENT_AUTHORIZED_RUN=="1" es el gate más externo para
+# aperturas en modo real (se chequea antes de tocar el cliente HTTP, la
+# sombra, o el presupuesto) -- sin runner.sh detrás (única vía que la
+# exporta), ninguna apertura real debe poder alcanzar la API, sea cual
+# sea el símbolo o el monto.
+
+
+@pytest.mark.parametrize(
+    "symbol, amount", [("SPY", 10.0), ("QQQ", 20.0), ("ETH", 5.0)], ids=["spy", "qqq", "eth"]
+)
+def test_open_real_sin_autorizacion_nunca_llega_al_cliente(tmp_path, monkeypatch, symbol, amount):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.delenv("ETOROAGENT_AUTHORIZED_RUN", raising=False)
+    state_dir = write_state(tmp_path, _base_state(), _base_equity())
+
+    rc = place_order.main(
+        ["open", "--symbol", symbol, "--amount", str(amount), "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: _ExplosiveClient(),
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "autoriza" in journal.lower()
+
+
+# ============================================================================
+# Invariante 10 (WP7): truncar/sustituir equity.csv no puede rebajar el
+# drawdown efectivo si la sombra tiene el pico.
+# ============================================================================
+#
+# Garantía: el pico usado para el drawdown en modo real es el MAX entre
+# state/equity.csv y la sombra fuera del repo -- ningún truncamiento o
+# sustitución del archivo (que pierda el pico histórico) puede esconder
+# un drawdown real mientras la sombra lo retenga.
+
+
+@pytest.mark.wp7_real
+@pytest.mark.parametrize(
+    "truncated_equity",
+    [
+        [("2026-08-13", 700.0)],
+        [("2026-08-10", 750.0), ("2026-08-13", 700.0)],
+    ],
+    ids=["una_sola_fila_reciente", "dos_filas_sin_el_pico"],
+)
+def test_truncar_equity_no_rebaja_drawdown_efectivo_con_sombra(tmp_path, monkeypatch, truncated_equity):
+    monkeypatch.setenv("DRY_RUN", "0")
+    state_dir = write_state(tmp_path, _base_state(), truncated_equity)
+    shadow_dir = tmp_path / "sombra"
+    shadow_dir.mkdir()
+    (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("date,total\n2026-08-01,1000.0\n")
+    (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text(
+        json.dumps({"runId": None, "count": 0, "date": None, "dailyCount": 0})
+    )
+    client = _mock_client_for("SPY", 1)
+    client.get_pnl.return_value = {
+        "clientPortfolio": {
+            "credit": 1000.0, "positions": [], "ordersForOpen": [], "orders": [], "mirrors": []
+        }
+    }
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "defensivo" in journal.lower()
+    client.open_position_by_amount.assert_not_called()
+
+
+# ============================================================================
+# Invariante 11 (WP7): resetear .run_orders.json no rebaja el presupuesto
+# efectivo con sombra presente.
+# ============================================================================
+#
+# Garantía: el presupuesto de órdenes efectivo en modo real es el MAX de
+# contadores entre el archivo y la sombra -- borrar o reescribir el
+# archivo real a contadores más bajos (mismo runId/fecha) no puede
+# rebajar el presupuesto ya consumido si la sombra retuvo el conteo real.
+
+
+@pytest.mark.wp7_real
+@pytest.mark.parametrize(
+    "file_budget_present",
+    [False, True],
+    ids=["archivo_ausente_reseteado", "archivo_reescrito_a_cero"],
+)
+def test_resetear_run_orders_no_rebaja_presupuesto_efectivo_con_sombra(
+    tmp_path, monkeypatch, file_budget_present
+):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("ETOROAGENT_RUN_ID", "run-x")
+    state_dir = write_state(tmp_path, _base_state(), _base_equity())
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+
+    if file_budget_present:
+        (state_dir / place_order.ORDER_BUDGET_FILE).write_text(
+            json.dumps({"runId": "run-x", "count": 0, "date": today, "dailyCount": 0})
+        )
+    # si file_budget_present es False, el archivo simplemente no existe --
+    # equivalente a un `rm` del presupuesto en curso.
+
+    shadow_dir = tmp_path / "sombra"
+    shadow_dir.mkdir()
+    (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("date,total\n2026-08-01,1000.0\n")
+    (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text(
+        json.dumps(
+            {
+                "runId": "run-x",
+                "count": place_order.MAX_ORDERS_PER_RUN,
+                "date": today,
+                "dailyCount": place_order.MAX_ORDERS_PER_RUN,
+            }
+        )
+    )
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: _ExplosiveClient(),
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "tope" in journal.lower() or "presupuesto" in journal.lower()
+
+
+# ============================================================================
+# Invariante 12 (WP7): los closes pasan en modo real bajo TODAS las
+# combinaciones adversas nuevas (sin sombra, sin autorización, API caída).
+# ============================================================================
+#
+# Garantía: ninguno de los tres candados nuevos de WP7 (autorización,
+# sombra, reconstrucción desde la API) aplica a los cierres -- reducir
+# riesgo nunca debe poder quedar bloqueado por ellos, ni individualmente
+# ni combinados.
+
+
+@pytest.mark.wp7_real
+@pytest.mark.parametrize(
+    "sin_sombra, sin_autorizacion, api_caida",
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+    ],
+    ids=["todas_adversas", "solo_sin_sombra", "solo_sin_autorizacion", "solo_api_caida", "sin_sombra_y_sin_autorizacion"],
+)
+def test_close_pasa_en_modo_real_bajo_combinaciones_adversas_nuevas(
+    tmp_path, monkeypatch, sin_sombra, sin_autorizacion, api_caida
+):
+    monkeypatch.setenv("DRY_RUN", "0")
+    if sin_autorizacion:
+        monkeypatch.delenv("ETOROAGENT_AUTHORIZED_RUN", raising=False)
+    else:
+        monkeypatch.setenv("ETOROAGENT_AUTHORIZED_RUN", "1")
+
+    state = _base_state(
+        cash=100.0,
+        positions=[{"positionId": "pos-1", "symbol": "SPY", "instrumentId": 1, "valueUsd": 50.0}],
+    )
+    state_dir = write_state(tmp_path, state, _base_equity(total=150.0))
+
+    shadow_dir = tmp_path / "sombra"
+    if not sin_sombra:
+        shadow_dir.mkdir()
+        (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("date,total\n2026-08-01,1000.0\n")
+        (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text(
+            json.dumps({"runId": None, "count": 0, "date": None, "dailyCount": 0})
+        )
+
+    client = MagicMock()
+    if api_caida:
+        client.get_pnl.side_effect = RuntimeError("API caída")
+    client.close_position.return_value = {"ok": True}
+
+    rc = place_order.main(
+        ["close", "--position-id", "pos-1", "--symbol", "SPY"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    client.close_position.assert_called_once()
