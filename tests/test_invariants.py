@@ -756,3 +756,111 @@ def test_close_pasa_en_modo_real_bajo_combinaciones_adversas_nuevas(
 
     assert rc == 0
     client.close_position.assert_called_once()
+
+
+# ============================================================================
+# Invariante 13 (WP8): una divergencia de integridad detectada deja el
+# sistema con opens bloqueadas (flag) sin afectar closes.
+# ============================================================================
+#
+# Garantía: scripts/runner.sh, al detectar una divergencia archivo-vs-
+# sombra (scripts/integrity_check.py, exit 3), crea state/.needs_
+# reconciliation con el mismo mecanismo ya existente para corridas
+# abortadas (WP2) -- este invariante confirma que ese mecanismo REUTILIZADO
+# sigue cumpliendo su contrato completo para el nuevo caso de uso: toda
+# apertura en cualquier modo (dry-run y real) queda bloqueada mientras el
+# flag exista, y todo cierre sigue pasando sin importar el modo ni el
+# resto del estado del sistema (presupuesto agotado, sin autorización,
+# sin sombra, API caída) -- reducir riesgo nunca debe poder depender de
+# que la divergencia ya se haya resuelto.
+
+
+def _write_integrity_divergence_flag(state_dir: Path) -> None:
+    """Mismo formato JSON que scripts/runner.sh escribe en
+    state/.needs_reconciliation cuando integrity_check.py detecta una
+    divergencia (WP8) -- ver la rama `INTEGRITY_RC -eq 3` del script."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / ".needs_reconciliation").write_text(
+        json.dumps(
+            {
+                "reason": "divergencia de integridad archivo-vs-sombra",
+                "log": "reports/2026-08-14-1000-crypto-integrity.log",
+                "at": "2026-08-14 10:00 -0300",
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("dry_run_value", ["1", "0"], ids=["dry_run", "modo_real"])
+def test_divergencia_de_integridad_bloquea_opens_en_cualquier_modo(
+    tmp_path, monkeypatch, dry_run_value
+):
+    monkeypatch.setenv("DRY_RUN", dry_run_value)
+    state_dir = write_state(tmp_path, _base_state(), _base_equity())
+    _write_integrity_divergence_flag(state_dir)
+
+    rc = place_order.main(
+        ["open", "--symbol", "SPY", "--amount", "10", "--stop-loss-pct", "0.10"],
+        state_dir=state_dir,
+        make_client=lambda: _ExplosiveClient(),
+    )
+
+    assert rc == 2
+    journal = (state_dir / "journal.md").read_text()
+    assert "reconciliaci" in journal.lower()
+
+
+@pytest.mark.wp7_real
+@pytest.mark.parametrize(
+    "dry_run_value, sin_autorizacion, sin_sombra",
+    [
+        ("1", False, False),
+        ("0", False, False),
+        ("0", True, False),
+        ("0", False, True),
+        ("0", True, True),
+    ],
+    ids=["dry_run", "modo_real", "modo_real_sin_autorizacion", "modo_real_sin_sombra", "modo_real_sin_nada"],
+)
+def test_divergencia_de_integridad_no_afecta_closes(
+    tmp_path, monkeypatch, dry_run_value, sin_autorizacion, sin_sombra
+):
+    monkeypatch.setenv("DRY_RUN", dry_run_value)
+    if sin_autorizacion:
+        monkeypatch.delenv("ETOROAGENT_AUTHORIZED_RUN", raising=False)
+    else:
+        monkeypatch.setenv("ETOROAGENT_AUTHORIZED_RUN", "1")
+
+    state = _base_state(
+        cash=100.0,
+        positions=[{"positionId": "pos-1", "symbol": "SPY", "instrumentId": 1, "valueUsd": 50.0}],
+    )
+    state_dir = write_state(tmp_path, state, _base_equity(total=150.0))
+    _write_integrity_divergence_flag(state_dir)
+
+    shadow_dir = tmp_path / "sombra"
+    if not sin_sombra:
+        shadow_dir.mkdir()
+        (shadow_dir / place_order.EQUITY_SHADOW_FILE).write_text("date,total\n2026-08-01,1000.0\n")
+        (shadow_dir / place_order.RUN_ORDERS_SHADOW_FILE).write_text(
+            json.dumps({"runId": None, "count": 0, "date": None, "dailyCount": 0})
+        )
+
+    client = MagicMock()
+    client.close_position.return_value = {"ok": True}
+
+    rc = place_order.main(
+        ["close", "--position-id", "pos-1", "--symbol", "SPY"],
+        state_dir=state_dir,
+        shadow_dir=shadow_dir,
+        make_client=lambda: client,
+    )
+
+    assert rc == 0
+    journal = (state_dir / "journal.md").read_text()
+    if dry_run_value == "0":
+        client.close_position.assert_called_once()
+        assert "CERRADA" in journal
+    else:
+        client.close_position.assert_not_called()
+        assert "DRY_RUN" in journal
