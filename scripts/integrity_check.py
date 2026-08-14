@@ -45,12 +45,35 @@ Dos comparaciones, mismo criterio de "mismo contexto" que shadow_sync.py:
     virgen, nunca hubo una corrida real) -> íntegro, nada que comparar
     todavía.
 
+WP8b (sign-off del auditor sobre WP8): las dos comparaciones de arriba
+comparan ARCHIVO vs SOMBRA -- pero un compuesto de DOS sustituciones
+coordinadas puede envenenar AMBOS lados EN SINCRONÍA al mismo valor más
+bajo, y esas dos comparaciones no ven ninguna divergencia (archivo y
+sombra siguen "de acuerdo" entre sí, solo que los dos mienten igual).
+Tercera comparación, --expected-peak: el pico de equity es MONÓTONO NO
+DECRECIENTE bajo operación legítima -- nunca debería bajar. runner.sh lee
+el pico combinado (max de archivo y sombra) ANTES de lanzar `claude` y lo
+retiene EN UNA VARIABLE DE SHELL (memoria del proceso del runner -- a
+diferencia de un archivo, ningún `cp -r` puede envenenar una variable de
+un proceso en ejecución). Después de la corrida, se le pasa ese valor a
+--expected-peak: si el pico combinado ACTUAL (max de archivo y sombra,
+ya con la sustitución/envenenamiento aplicado si lo hubo) es menor al
+valor retenido en memoria (más allá de la tolerancia), es DIVERGENCIA --
+sin importar que archivo y sombra sigan de acuerdo entre sí. El cálculo
+vive acá (testeable en aislamiento); el runner solo transporta el número
+(ver --print-peak, que expone la mitad "leer el pico combinado" de este
+mismo cálculo para que el runner no tenga que parsear CSVs/JSON él
+mismo).
+
 Exit codes: 0 = íntegro (sin divergencias) | 3 = divergencia detectada
 (el detalle de cada una se imprime a stdout, una por línea) | 1 = error
-propio de este script (nunca una divergencia -- ver main()). Un exit 1
-NO debe frenar la operación (scripts/runner.sh solo journalea un WARN):
-un chequeo roto no es evidencia de tamper, y la PREVENCIÓN (WP7) sigue
-activa de todos modos.
+propio de este script (nunca una divergencia real detectada -- ver
+main()). WP8b: a diferencia de la versión original de este script, un
+exit 1 SÍ frena la operación en runner.sh (mismo camino que un exit 3) --
+un verificador de integridad que no puede leerse a sí mismo con
+confianza no puede certificar que el sistema esté íntegro; journalear
+solo un WARN y seguir operando sería fail-open exactamente en el
+componente que existe para ser fail-closed.
 """
 import argparse
 import json
@@ -122,6 +145,59 @@ def check_equity(state_dir: Path, shadow_dir: Path):
     return None
 
 
+def combined_peak(state_dir: Path, shadow_dir: Path):
+    """Pico combinado (max) entre state/equity.csv y la sombra de
+    equity -- lo que el runner retiene EN MEMORIA (variable de shell)
+    antes de lanzar `claude`, y contra lo que se vuelve a calcular
+    después de la corrida para la comparación de monotonía (WP8b, ver
+    check_peak_monotonicity). None si ninguno de los dos lados tiene
+    ningún valor utilizable (proyecto virgen)."""
+    state_path = state_dir / EQUITY_FILE
+    shadow_path = shadow_dir / EQUITY_SHADOW_FILE
+    state_rows = _read_csv_rows(state_path) if state_path.exists() else []
+    shadow_rows = _read_csv_rows(shadow_path) if shadow_path.exists() else []
+    peaks = [p for p in (_peak(state_rows), _peak(shadow_rows)) if p is not None]
+    return max(peaks) if peaks else None
+
+
+def check_peak_monotonicity(
+    state_dir: Path, shadow_dir: Path, expected_peak, tolerance: float = EQUITY_PEAK_TOLERANCE
+):
+    """WP8b: el pico combinado (archivo y sombra) nunca debería bajar
+    respecto de expected_peak -- el valor que el runner leyó y retuvo EN
+    MEMORIA antes de lanzar `claude`, inmune a cualquier sustitución de
+    archivos ocurrida DURANTE la corrida (a diferencia de check_equity,
+    que solo compara archivo contra sombra entre sí y no ve nada si
+    ambos fueron envenenados al mismo valor, en sincronía).
+
+    expected_peak es None cuando el caller no lo provee (runner.sh en su
+    primera corrida jamás, sin historial todavía; o cualquier invocación
+    manual/de test que no pasa --expected-peak) -- en ese caso esta
+    comparación no aplica, devuelve None (no es una divergencia, es
+    'no verificable con esta pieza')."""
+    if expected_peak is None:
+        return None
+
+    current = combined_peak(state_dir, shadow_dir)
+    if current is None:
+        return (
+            f"monotonía de pico: no hay ningún valor de equity utilizable "
+            f"(se esperaba un pico >= {expected_peak!r}, retenido en memoria "
+            f"antes de la corrida)"
+        )
+
+    threshold = expected_peak * (1 - tolerance)
+    if current < threshold:
+        return (
+            f"monotonía de pico: pico actual (max archivo/sombra) = {current!r} "
+            f"< pico retenido en memoria del runner antes de la corrida = "
+            f"{expected_peak!r} (más allá de la tolerancia de {tolerance:.2%}) "
+            f"-- el compuesto de dos fuentes envenenadas en sincronía no "
+            f"engaña a la memoria del proceso"
+        )
+    return None
+
+
 def check_budget(state_dir: Path, shadow_dir: Path):
     """Devuelve un mensaje de divergencia, o None si el presupuesto es
     íntegro (o no comparable: contexto distinto, o ambos lados ausentes)."""
@@ -164,10 +240,14 @@ def check_budget(state_dir: Path, shadow_dir: Path):
     return None
 
 
-def check(state_dir: Path, shadow_dir: Path) -> list:
+def check(state_dir: Path, shadow_dir: Path, expected_peak=None) -> list:
     """Lista de mensajes de divergencia (vacía si todo íntegro)."""
     divergencias = []
-    for resultado in (check_equity(state_dir, shadow_dir), check_budget(state_dir, shadow_dir)):
+    for resultado in (
+        check_equity(state_dir, shadow_dir),
+        check_budget(state_dir, shadow_dir),
+        check_peak_monotonicity(state_dir, shadow_dir, expected_peak),
+    ):
         if resultado:
             divergencias.append(resultado)
     return divergencias
@@ -177,6 +257,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="integrity_check.py")
     parser.add_argument("--state-dir", default=None)
     parser.add_argument("--shadow-dir", default=None)
+    # WP8b: pico retenido en memoria del runner ANTES de la corrida, para
+    # la comparación de monotonía (ver check_peak_monotonicity).
+    parser.add_argument("--expected-peak", type=float, default=None)
+    # WP8b: modo de consulta -- imprime el pico combinado actual (o nada
+    # si no hay ninguno todavía) y sale 0, sin correr ninguna comparación.
+    # El runner lo usa ANTES de lanzar `claude` para capturar el valor
+    # que después le pasa de vuelta como --expected-peak.
+    parser.add_argument("--print-peak", action="store_true")
     return parser
 
 
@@ -190,8 +278,21 @@ def main(argv=None) -> int:
     )
     shadow_dir = Path(args.shadow_dir) if args.shadow_dir else default_shadow_dir()
 
+    if args.print_peak:
+        # WP8b: modo de consulta pura -- nunca falla (ver docstring de
+        # --print-peak): el runner captura esto ANTES de lanzar `claude`
+        # y lo retiene en una variable de shell, así que este comando NO
+        # puede abortar el runner (set -euo pipefail) por una lectura que
+        # a lo sumo debería devolver "sin dato todavía", nunca un error.
+        try:
+            peak = combined_peak(state_dir, shadow_dir)
+        except Exception:
+            peak = None
+        print(peak if peak is not None else "")
+        return 0
+
     try:
-        divergencias = check(state_dir, shadow_dir)
+        divergencias = check(state_dir, shadow_dir, expected_peak=args.expected_peak)
     except Exception as exc:
         print(f"ERROR: no se pudo verificar la integridad: {exc}", file=sys.stderr)
         return 1

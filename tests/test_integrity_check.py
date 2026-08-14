@@ -272,3 +272,206 @@ def test_main_honra_home_para_la_sombra_por_default(tmp_path, monkeypatch):
     rc = integrity_check.main(["--state-dir", str(state_dir)])
 
     assert rc == 0
+
+
+# --- WP8b: monotonía del pico retenido en memoria (--expected-peak) -------
+#
+# El compuesto de DOS sustituciones coordinadas (una sobre state/, otra
+# sobre la sombra) puede envenenar AMBOS lados en sincronía al mismo
+# valor más bajo -- check_equity/check_budget no ven nada porque archivo
+# y sombra siguen "de acuerdo" entre sí. check_peak_monotonicity compara
+# contra un valor que NINGÚN archivo puede envenenar: el pico que el
+# runner leyó y retuvo en una variable de shell (memoria del proceso)
+# ANTES de lanzar `claude`.
+
+
+def test_combined_peak_max_entre_archivo_y_sombra(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-01", 900.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 1000.0)])
+
+    assert integrity_check.combined_peak(state_dir, shadow_dir) == 1000.0
+
+
+def test_combined_peak_ambos_ausentes_es_none(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+
+    assert integrity_check.combined_peak(state_dir, shadow_dir) is None
+
+
+def test_check_peak_monotonicity_sin_expected_peak_no_aplica(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-01", 100.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 1000.0)])
+
+    assert integrity_check.check_peak_monotonicity(state_dir, shadow_dir, None) is None
+
+
+def test_check_peak_monotonicity_integro_cuando_el_pico_se_mantiene(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-01", 10000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 10000.0)])
+
+    assert integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0) is None
+
+
+def test_check_peak_monotonicity_ambos_lados_envenenados_en_sincronia_es_divergencia(tmp_path):
+    # El vector EXACTO del auditor: pico pre-corrida 10000, retenido en
+    # memoria; ambos archivos (state/equity.csv Y la sombra) fueron
+    # sustituidos en sincronía a un pico de 8000. check_equity NO ve
+    # nada (8000 == 8000, ambos "de acuerdo") -- solo la comparación
+    # contra la memoria lo detecta.
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 8000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 8000.0)])
+
+    # Control: check_equity, comparando SOLO archivo vs sombra, no ve la
+    # divergencia -- confirma que el compuesto realmente evade esa pieza.
+    assert integrity_check.check_equity(state_dir, shadow_dir) is None
+
+    msg = integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0)
+
+    assert msg is not None
+    assert "monoton" in msg.lower()
+
+
+def test_check_peak_monotonicity_crecimiento_legitimo_no_es_divergencia(tmp_path):
+    # El pico crece legítimamente entre corridas (10000 -> 10050) -- no
+    # debe dispararse.
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 10050.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 10000.0)])
+
+    assert integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0) is None
+
+
+def test_check_peak_monotonicity_tolerancia_de_redondeo_no_dispara(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    # 0.02% de diferencia -- muy por debajo de la tolerancia (0.1%).
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 9998.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 9998.0)])
+
+    assert integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0) is None
+
+
+def test_check_peak_monotonicity_justo_debajo_de_la_tolerancia_si_dispara(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 9900.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 9900.0)])
+
+    assert integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0) is not None
+
+
+def test_check_peak_monotonicity_sin_ningun_valor_utilizable_es_divergencia(tmp_path):
+    # Se esperaba un pico (memoria del runner no vacía) pero ninguno de
+    # los dos lados tiene ahora ningún valor utilizable -- fail-closed.
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+
+    msg = integrity_check.check_peak_monotonicity(state_dir, shadow_dir, 10000.0)
+
+    assert msg is not None
+
+
+def test_check_incluye_monotonicidad_cuando_se_pasa_expected_peak(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 8000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 8000.0)])
+
+    divergencias = integrity_check.check(state_dir, shadow_dir, expected_peak=10000.0)
+
+    assert len(divergencias) == 1
+    assert "monoton" in divergencias[0].lower()
+
+
+def test_check_sin_expected_peak_no_agrega_divergencia_de_monotonicidad(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 8000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 8000.0)])
+
+    assert integrity_check.check(state_dir, shadow_dir) == []
+
+
+def test_main_expected_peak_bajo_dispara_divergencia_rc3(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 8000.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 8000.0)])
+
+    rc = integrity_check.main(
+        [
+            "--state-dir", str(state_dir),
+            "--shadow-dir", str(shadow_dir),
+            "--expected-peak", "10000",
+        ]
+    )
+
+    assert rc == 3
+
+
+def test_main_expected_peak_creciente_rc0(tmp_path):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-14", 10050.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 10000.0)])
+
+    rc = integrity_check.main(
+        [
+            "--state-dir", str(state_dir),
+            "--shadow-dir", str(shadow_dir),
+            "--expected-peak", "10000",
+        ]
+    )
+
+    assert rc == 0
+
+
+def test_main_print_peak_imprime_el_pico_combinado(tmp_path, capsys):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    _write_csv(state_dir / "equity.csv", [("2026-08-01", 900.0)])
+    _write_csv(shadow_dir / "equity-shadow.csv", [("2026-08-01", 1000.0)])
+
+    rc = integrity_check.main(
+        ["--state-dir", str(state_dir), "--shadow-dir", str(shadow_dir), "--print-peak"]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == "1000.0"
+
+
+def test_main_print_peak_sin_datos_imprime_vacio_y_rc0(tmp_path, capsys):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+
+    rc = integrity_check.main(
+        ["--state-dir", str(state_dir), "--shadow-dir", str(shadow_dir), "--print-peak"]
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == ""
+
+
+def test_main_print_peak_nunca_falla_ante_datos_corruptos(tmp_path, capsys):
+    state_dir = tmp_path / "state"
+    shadow_dir = tmp_path / "shadow"
+    state_dir.mkdir(parents=True)
+    (state_dir / "equity.csv").write_text("esto no es un csv valido de verdad\n\x00\x01")
+
+    rc = integrity_check.main(
+        ["--state-dir", str(state_dir), "--shadow-dir", str(shadow_dir), "--print-peak"]
+    )
+
+    assert rc == 0

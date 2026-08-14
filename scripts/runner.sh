@@ -14,8 +14,23 @@
 # journalea, crea state/.needs_reconciliation (bloquea aperturas por el
 # mecanismo ya existente), notifica al operador, y descarga ambos jobs de
 # launchd (kill-switch) para que no vuelva a correr desatendido hasta
-# revision manual. Un fallo del chequeo mismo (exit 1) solo journalea un
-# WARN -- no frena la operacion, la prevencion de WP7 sigue activa.
+# revision manual.
+#
+# WP8b (sign-off del auditor sobre WP8): comparar archivo contra sombra
+# no alcanza si un compuesto de sustituciones coordinadas envenena AMBOS
+# en sincronia al mismo valor mas bajo -- ni check_equity ni check_budget
+# ven nada, porque archivo y sombra siguen "de acuerdo" entre si. Este
+# runner lee el pico de equity combinado (max de archivo y sombra) ANTES
+# de lanzar `claude` y lo retiene EN UNA VARIABLE DE SHELL -- memoria del
+# propio proceso del runner, que ningun archivo puede envenenar durante
+# la corrida. Despues, se lo pasa a integrity_check.py via
+# --expected-peak: si el pico combinado ACTUAL bajo respecto de ese valor
+# retenido en memoria, es divergencia, sin importar que archivo y sombra
+# sigan de acuerdo entre si (ver check_peak_monotonicity en
+# scripts/integrity_check.py para el calculo exacto -- este script solo
+# transporta el numero). Ademas, un fallo del chequeo mismo (exit 1) hoy
+# frena igual que una divergencia (exit 3): un verificador que no puede
+# leerse a si mismo no puede certificar integridad.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:?uso: runner.sh equities|crypto}"
@@ -146,6 +161,16 @@ export ETOROAGENT_AUTHORIZED_RUN="1"
 
 sync_shadow  # WP7: ANTES de lanzar claude.
 
+# WP8b: pico de equity combinado (max archivo/sombra) retenido EN
+# MEMORIA de este proceso, ANTES de que `claude` corra -- ver el
+# docstring de scripts/integrity_check.py para el porque. --print-peak
+# nunca falla (devuelve vacio si no hay dato todavia); set +e/-e igual
+# por prudencia, para que un fallo inesperado tampoco aborte el runner
+# via set -e.
+set +e
+PRE_RUN_PEAK="$(/usr/bin/python3 scripts/integrity_check.py --print-peak)"
+set -e
+
 "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
   --allowedTools "Bash,Read,Write,Glob,Grep" \
   --max-turns 60 \
@@ -176,7 +201,15 @@ sync_shadow  # WP7: DESPUÉS de que claude termina (haya operado o no).
 # sync de arriba, nunca antes.
 INTEGRITY_LOG="reports/${STAMP}-${MODE}-integrity.log"
 set +e
-/usr/bin/python3 scripts/integrity_check.py > "$INTEGRITY_LOG" 2>&1
+if [ -n "$PRE_RUN_PEAK" ]; then
+  /usr/bin/python3 scripts/integrity_check.py --expected-peak "$PRE_RUN_PEAK" > "$INTEGRITY_LOG" 2>&1
+else
+  # Sin pico previo conocido (primera corrida real de la maquina, o la
+  # sombra/el archivo todavia no tienen ningun dato) -- la comparacion de
+  # monotonia no aplica todavia, las otras dos (archivo vs sombra) siguen
+  # activas igual.
+  /usr/bin/python3 scripts/integrity_check.py > "$INTEGRITY_LOG" 2>&1
+fi
 INTEGRITY_RC=$?
 set -e
 

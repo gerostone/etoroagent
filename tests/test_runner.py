@@ -354,6 +354,95 @@ def test_divergencia_de_integridad_journalea_flag_y_dispara_killswitch(tmp_path)
                 pass
 
 
+def test_compuesto_de_dos_sustituciones_coordinadas_es_detectado_por_monotonia(tmp_path):
+    # WP8b: el vector exacto que evadía check_equity -- el atacante
+    # descubre Y toca AMBOS lados (state/equity.csv real Y la sombra bajo
+    # HOME redirigido, que el fake claude simula tocar como si conociera
+    # su ubicación) al MISMO valor bajo, en sincronía. check_equity por
+    # sí solo (archivo vs sombra) NO vería nada -- ambos "de acuerdo" en
+    # el valor envenenado. Solo el pico retenido en memoria del runner
+    # ANTES de la corrida (inmune a cualquier archivo, real o sombra)
+    # detecta que el pico bajó.
+    equity_backup = _backup(EQUITY_CSV)
+    budget_backup = _backup(RUN_ORDERS_JSON)
+    journal_backup = _backup(JOURNAL)
+    recon_backup = _backup(NEEDS_RECONCILIATION)
+    result = None
+
+    try:
+        home_dir = tmp_path / "home"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        marker = tmp_path / "launchctl_calls.txt"
+        _fake_launchctl_stub(bin_dir, marker)
+
+        # El fake claude sobrescribe AMBOS lados -- el archivo real Y la
+        # sombra (bajo HOME redirigido) -- al MISMO valor bajo, DESPUÉS
+        # de que el sync PRE-corrida ya sincronizó el pico histórico real
+        # (y el runner ya lo retuvo en su variable de shell, invisible
+        # para este script).
+        fake_claude = tmp_path / "fake_claude.sh"
+        fake_claude.write_text(
+            "#!/bin/bash\n"
+            "mkdir -p state\n"
+            "printf 'date,total\\n2099-01-01,1.0\\n' > state/equity.csv\n"
+            'SHADOW_DIR="$HOME/Library/Application Support/etoroagent"\n'
+            'mkdir -p "$SHADOW_DIR"\n'
+            'printf \'date,total\\n2099-01-01,1.0\\n\' > "$SHADOW_DIR/equity-shadow.csv"\n'
+            "exit 0\n"
+        )
+        fake_claude.chmod(0o755)
+
+        result = _run_runner(
+            "crypto",
+            {
+                "CLAUDE_BIN": str(fake_claude),
+                "DRY_RUN": "1",
+                "HOME": str(home_dir),
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        # Control: si SOLO comparáramos archivo vs sombra post-corrida,
+        # ambos muestran 1.0 -- "de acuerdo" entre sí, ninguna
+        # divergencia visible por esa vía. La detección tiene que venir
+        # de la monotonía contra la memoria del runner.
+        shadow_csv = home_dir / "Library" / "Application Support" / "etoroagent" / "equity-shadow.csv"
+        assert shadow_csv.exists()
+
+        journal_text = JOURNAL.read_text()
+        assert "INTEGRIDAD" in journal_text
+        assert "divergencia" in journal_text.lower()
+
+        assert NEEDS_RECONCILIATION.exists()
+        flag_data = json.loads(NEEDS_RECONCILIATION.read_text())
+        assert "integridad" in flag_data["reason"].lower()
+
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.5)
+        assert marker.exists(), "el kill-switch no invocó el launchctl stub a tiempo"
+    finally:
+        _restore(EQUITY_CSV, equity_backup)
+        _restore(RUN_ORDERS_JSON, budget_backup)
+        _restore(JOURNAL, journal_backup)
+        _restore(NEEDS_RECONCILIATION, recon_backup)
+        if result is not None:
+            _cleanup_report_log(result.stdout)
+        for stray_log in (ROOT / "reports").glob("*-crypto-integrity.log"):
+            stray_log.unlink()
+        pidfile = LOCK_DIR / "pid"
+        if pidfile.exists():
+            pidfile.unlink()
+        if LOCK_DIR.exists():
+            try:
+                LOCK_DIR.rmdir()
+            except OSError:
+                pass
+
+
 def test_integridad_intacta_no_journalea_ni_dispara_killswitch(real_state_backup, tmp_path):
     # Control negativo: una corrida normal (sin divergencia) no debe
     # journalear INTEGRIDAD ni tocar el flag de reconciliación.
