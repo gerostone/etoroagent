@@ -99,11 +99,15 @@ def _cleanup_report_log(stdout: str) -> None:
 
 
 def test_claude_fallido_journalea_abortada_y_crea_flag_de_reconciliacion(
-    real_state_backup,
+    real_state_backup, tmp_path
 ):
+    # WP7: runner.sh ahora sincroniza la sombra de integridad (fuera del
+    # repo, bajo $HOME) antes/después de cada corrida -- redirigimos HOME
+    # a un tmp_path para no tocar el directorio real del operador durante
+    # el test.
     result = _run_runner(
         "crypto",
-        {"CLAUDE_BIN": "/usr/bin/false", "DRY_RUN": "1"},
+        {"CLAUDE_BIN": "/usr/bin/false", "DRY_RUN": "1", "HOME": str(tmp_path / "home")},
     )
     try:
         # runner.sh captura el fallo de claude internamente (rc del propio
@@ -142,3 +146,92 @@ def test_lock_ocupado_journalea_skip(real_state_backup):
     assert "SKIP" in journal_text
     assert "corrida crypto no corrió" in journal_text
     assert "lock ocupado" in journal_text
+
+
+# --- WP7: autorización de corridas reales + sombra de integridad -----------
+#
+# runner.sh es la única vía sancionada para corridas reales (DRY_RUN=0
+# desatendido): exporta ETOROAGENT_AUTHORIZED_RUN=1 (place_order.py lo
+# exige para toda apertura en modo real) y sincroniza la sombra de
+# integridad fuera del repo (scripts/shadow_sync.py) antes de lanzar
+# `claude` y después de que termina. HOME se redirige a un tmp_path en
+# todos estos tests para no tocar el directorio real del operador.
+
+
+def _fake_claude_que_captura_env(path: Path, var_name: str, marker_path: Path, exit_code: int = 0):
+    """Escribe un script ejecutable que, en vez de invocar la API de
+    Anthropic, vuelca el valor de `var_name` a `marker_path` y termina con
+    `exit_code` -- permite verificar qué exportó runner.sh sin depender
+    del CLI real de Claude."""
+    path.write_text(
+        "#!/bin/bash\n"
+        f'echo "${{{var_name}:-AUSENTE}}" > "{marker_path}"\n'
+        f"exit {exit_code}\n"
+    )
+    path.chmod(0o755)
+
+
+def test_authorized_run_exportado_en_el_entorno_de_claude(real_state_backup, tmp_path):
+    marker = tmp_path / "authorized_marker.txt"
+    fake_claude = tmp_path / "fake_claude.sh"
+    _fake_claude_que_captura_env(fake_claude, "ETOROAGENT_AUTHORIZED_RUN", marker, exit_code=0)
+
+    result = _run_runner(
+        "crypto",
+        {"CLAUDE_BIN": str(fake_claude), "DRY_RUN": "1", "HOME": str(tmp_path / "home")},
+    )
+
+    try:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert marker.exists()
+        assert marker.read_text().strip() == "1"
+    finally:
+        _cleanup_report_log(result.stdout)
+
+
+def test_sombra_sincronizada_antes_y_despues_de_la_corrida(real_state_backup, tmp_path):
+    # El fake claude no toca la sombra -- si aparece poblada después de la
+    # corrida, fue el sync PRE (antes de lanzarlo) el que la creó (el sync
+    # POST, si el PRE ya sincronizó todo lo disponible, puede no agregar
+    # filas nuevas -- lo que importa es que el mecanismo corrió, no que
+    # cada llamada individual haya escrito algo).
+    home_dir = tmp_path / "home"
+    marker = tmp_path / "marker.txt"
+    fake_claude = tmp_path / "fake_claude.sh"
+    _fake_claude_que_captura_env(fake_claude, "ETOROAGENT_RUN_ID", marker, exit_code=0)
+
+    result = _run_runner(
+        "crypto",
+        {"CLAUDE_BIN": str(fake_claude), "DRY_RUN": "1", "HOME": str(home_dir)},
+    )
+
+    try:
+        assert result.returncode == 0, result.stdout + result.stderr
+        shadow_dir = home_dir / "Library" / "Application Support" / "etoroagent"
+        # El repo real tiene state/equity.csv y state/.run_orders.json
+        # (corridas reales previas, ver tests/test_shadow_sync.py para la
+        # lógica de sync en aislamiento) -- sync_shadow() debe reflejarlos
+        # en la sombra bajo el HOME redirigido.
+        if (ROOT / "state" / "equity.csv").exists():
+            assert (shadow_dir / "equity-shadow.csv").exists()
+        if (ROOT / "state" / ".run_orders.json").exists():
+            assert (shadow_dir / "run-orders-shadow.json").exists()
+    finally:
+        _cleanup_report_log(result.stdout)
+
+
+def test_sombra_sincronizada_incluso_si_claude_aborta(real_state_backup, tmp_path):
+    home_dir = tmp_path / "home"
+    result = _run_runner(
+        "crypto",
+        {"CLAUDE_BIN": "/usr/bin/false", "DRY_RUN": "1", "HOME": str(home_dir)},
+    )
+    try:
+        assert result.returncode == 0, result.stdout + result.stderr
+        shadow_dir = home_dir / "Library" / "Application Support" / "etoroagent"
+        if (ROOT / "state" / "equity.csv").exists():
+            assert (shadow_dir / "equity-shadow.csv").exists()
+    finally:
+        _cleanup_report_log(result.stdout)
+        if NEEDS_RECONCILIATION.exists():
+            NEEDS_RECONCILIATION.unlink()

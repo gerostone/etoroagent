@@ -1,5 +1,12 @@
 #!/bin/bash
 # Lanza una corrida del agente. Uso: runner.sh equities|crypto
+#
+# WP7: unica via sancionada para corridas reales (DRY_RUN=0 desatendido).
+# Exporta ETOROAGENT_AUTHORIZED_RUN=1 (place_order.py lo exige para toda
+# apertura en modo real -- ver su docstring, pieza 3) y sincroniza la
+# sombra de integridad fuera del repo (scripts/shadow_sync.py) antes de
+# lanzar `claude` y despues de que termina (haya operado o no) -- ver el
+# docstring de shadow_sync.py para el algoritmo de merge exacto.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE="${1:?uso: runner.sh equities|crypto}"
@@ -13,6 +20,15 @@ mkdir -p state reports
 # explícito), para quedar legible junto al resto del journal.
 journal_line() {
   printf -- "- %s %s\n" "$(date +"%Y-%m-%d %H:%M %z")" "$1" >> state/journal.md
+}
+
+# WP7: sincroniza la sombra de integridad fuera del repo. Best-effort a
+# proposito (no aborta la corrida si falla) -- si la sombra queda
+# desactualizada/ausente, place_order.py ya bloquea aperturas en modo
+# real hasta que una sincronizacion exitosa la restaure (fail-closed del
+# lado del candado, no de este script).
+sync_shadow() {
+  /usr/bin/python3 scripts/shadow_sync.py || echo "WARN: fallo la sincronizacion de la sombra de integridad" >&2
 }
 
 LOCK="state/.runner.lock"
@@ -113,6 +129,14 @@ STAMP="$(date +%F-%H%M%S)"
 # scripts/place_order.py) se trackea por ETOROAGENT_RUN_ID -- una corrida
 # real de principio a fin, no un proceso individual de place_order.py.
 export ETOROAGENT_RUN_ID="${STAMP}-${MODE}"
+# WP7/pieza 3: única vía sancionada para corridas reales -- place_order.py
+# exige esta variable para toda apertura en modo real (DRY_RUN=0). El
+# agente nunca la asigna inline (scripts/risk_hook.py lo bloquea, mismo
+# criterio que ETOROAGENT_RUN_ID/ETOROAGENT_STATE_DIR).
+export ETOROAGENT_AUTHORIZED_RUN="1"
+
+sync_shadow  # WP7: ANTES de lanzar claude.
+
 "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
   --allowedTools "Bash,Read,Write,Glob,Grep" \
   --max-turns 60 \
@@ -133,4 +157,7 @@ export ETOROAGENT_RUN_ID="${STAMP}-${MODE}"
   # falla (headless sin sesión gráfica, no-mac), no debe romper el runner.
   osascript -e "display notification \"corrida ${MODE} abortada — ver journal\" with title \"etoro-agent\"" || true
 }
+
+sync_shadow  # WP7: DESPUÉS de que claude termina (haya operado o no).
+
 echo "corrida ${MODE} terminada: reports/${STAMP}-${MODE}.log"
