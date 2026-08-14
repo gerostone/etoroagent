@@ -1285,3 +1285,56 @@ def test_permite_asignacion_de_authorized_run_sin_script_autorizado():
 def test_permite_mencion_de_authorized_run_sin_asignacion():
     r = run_hook('echo "corriendo con ETOROAGENT_AUTHORIZED_RUN $ETOROAGENT_AUTHORIZED_RUN"')
     assert r.returncode == 0
+
+
+# --- WP8: scripts/integrity_check.py allowlisteado como script autorizado --
+#
+# A diferencia de scripts/shadow_sync.py (que ESCRIBE la sombra y nunca
+# debe invocarlo el agente), integrity_check.py es de solo lectura -- un
+# auto-diagnóstico que el agente sí puede correr directamente. Se agrega
+# a la MISMA lista de scripts autorizados que ya eximía a
+# place_order/snapshot/candles/reconcile, tanto para la excepción (a) del
+# default-deny por mención (WP6/N11) como para la regla (D) de
+# asignación inline de variables ETOROAGENT_*.
+
+
+def test_permite_integrity_check_script():
+    r = run_hook(".venv/bin/python scripts/integrity_check.py")
+    assert r.returncode == 0
+
+
+def test_permite_integrity_check_con_flags():
+    r = run_hook(
+        ".venv/bin/python scripts/integrity_check.py --state-dir /tmp/x --shadow-dir /tmp/y"
+    )
+    assert r.returncode == 0
+
+
+def test_bloquea_authorized_run_inline_con_integrity_check():
+    r = run_hook("ETOROAGENT_AUTHORIZED_RUN=1 .venv/bin/python scripts/integrity_check.py")
+    assert r.returncode == 2
+
+
+def test_bloquea_state_dir_inline_con_integrity_check():
+    r = run_hook("ETOROAGENT_STATE_DIR=/tmp/fake .venv/bin/python scripts/integrity_check.py")
+    assert r.returncode == 2
+
+
+def test_bloquea_shadow_sync_sigue_sin_ser_script_autorizado_wp8():
+    # Control negativo: shadow_sync.py NO se allowlistea (a propósito, ver
+    # WP7) -- una mención de archivo protegido junto a su invocación
+    # sigue bloqueada tras el cambio de WP8.
+    r = run_hook("python3 scripts/shadow_sync.py --shadow-dir /tmp/x/run-orders-shadow.json")
+    assert r.returncode == 2
+
+
+def test_permite_integrity_check_con_shadow_dir_que_menciona_equity_shadow():
+    # Mismo criterio que los otros 4 scripts autorizados: una mención de
+    # archivo protegido en el propio texto del comando (acá, dentro del
+    # valor de --shadow-dir) no debe bloquear la invocación real del
+    # script autorizado.
+    r = run_hook(
+        ".venv/bin/python scripts/integrity_check.py "
+        "--shadow-dir /tmp/x/equity-shadow.csv-backup"
+    )
+    assert r.returncode == 0

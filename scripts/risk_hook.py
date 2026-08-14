@@ -36,8 +36,9 @@ la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
       auditoría encontró un vehículo nuevo: rm -> python -c -> node -e/
       heredoc). WP6/N11 invierte la estrategia: DEFAULT-DENY POR
       MENCIÓN -- cualquier comando que nombre uno de estos cuatro
-      archivos se bloquea, salvo (a) invocar uno de los 4 scripts
-      autorizados, o (b) una lectura pura y completa (cat/head/tail/
+      archivos se bloquea, salvo (a) invocar uno de los 5 scripts
+      autorizados (WP8 suma integrity_check.py), o (b) una lectura pura
+      y completa (cat/head/tail/
       less/more/wc/ls/stat/grep/diff, o `python3 -m json.tool`), sin
       ningún otro operador de shell en el mismo comando -- ver
       PROTECTED_STATE_FILES más abajo. state/journal.md NO está en esta
@@ -48,14 +49,18 @@ la proxima corrida. Este hook intercepta cada tool call Bash y bloquea:
   (D) WP4/N4a, ampliado por WP7/pieza 3: asignar ETOROAGENT_RUN_ID,
       ETOROAGENT_STATE_DIR o ETOROAGENT_AUTHORIZED_RUN inline (export o
       prefijo VAR=valor) en un comando que además invoque
-      scripts/place_order.py, scripts/snapshot.py, scripts/candles.py o
-      scripts/reconcile.py. runner.sh setea estas variables por entorno
-      heredado, antes de invocar `claude` -- el agente nunca necesita
-      asignarlas inline. Si pudiera, resetearía a voluntad el presupuesto
-      de órdenes por corrida (WP1), redirigiría state/ para evadir la
-      reconciliación pendiente (WP2) o el presupuesto (WP1), o se
-      auto-autorizaría a operar en modo real sin haber pasado por
-      runner.sh (WP7).
+      scripts/place_order.py, scripts/snapshot.py, scripts/candles.py,
+      scripts/reconcile.py o scripts/integrity_check.py (WP8, único
+      script de diagnóstico -- solo lectura -- que el agente SÍ puede
+      invocar directamente, a diferencia de scripts/shadow_sync.py, que
+      escribe la sombra y nunca debe correrlo el agente). runner.sh
+      setea estas variables por entorno heredado, antes de invocar
+      `claude` -- el agente nunca necesita asignarlas inline. Si pudiera,
+      resetearía a voluntad el presupuesto de órdenes por corrida (WP1),
+      redirigiría state/ para evadir la reconciliación pendiente (WP2) o
+      el presupuesto (WP1), se auto-autorizaría a operar en modo real sin
+      haber pasado por runner.sh (WP7), o falsearía el resultado de su
+      propio auto-diagnóstico de integridad (WP8).
 
 Vias de LECTURA autorizadas (no las bloquea, no necesitan caso especial:
 su invocacion normal no contiene ningun patron vigilado en el texto del
@@ -640,7 +645,7 @@ _ENV_SPOOF_ASSIGN_RE = re.compile(
     r"ETOROAGENT_AUTHORIZED_RUN)\s*="
 )
 _ENV_SPOOF_SCRIPT_RE = re.compile(
-    r"scripts/(?:place_order|snapshot|candles|reconcile)\.py\b"
+    r"scripts/(?:place_order|snapshot|candles|reconcile|integrity_check)\.py\b"
 )
 
 
@@ -674,8 +679,9 @@ _ENV_SPOOF_SCRIPT_RE = re.compile(
 # las copias normalizadas sin comillas/backslashes, con y sin operador de
 # concatenacion "+" -- ver _normalizar/_normalizar_sin_concat) se bloquea
 # por DEFAULT, salvo:
-#   (a) invocacion real de uno de los 4 scripts autorizados
-#       (place_order.py/snapshot.py/candles.py/reconcile.py) -- sus
+#   (a) invocacion real de uno de los 5 scripts autorizados
+#       (place_order.py/snapshot.py/candles.py/reconcile.py/
+#       integrity_check.py, WP8) -- sus
 #       lineas de comando normales no mencionan estos archivos; la
 #       excepcion es por si un --flag futuro los nombra (p.ej. un
 #       --reason que cite state/.run_orders.json).
@@ -767,8 +773,9 @@ def _menciona_estado_protegido(segmento: str) -> bool:
 # runner.sh por entorno heredado, ANTES de invocar `claude` -- el agente
 # nunca necesita asignarlas inline en un Bash call. Bloquea CUALQUIER
 # asignacion (export o prefijo VAR=valor) de estas variables que aparezca
-# en el mismo comando que una invocacion de uno de los 4 scripts
-# autorizados (place_order/snapshot/candles/reconcile), siempre que
+# en el mismo comando que una invocacion de uno de los 5 scripts
+# autorizados (place_order/snapshot/candles/reconcile/integrity_check,
+# WP8), siempre que
 # ademas haya un vehiculo real de ejecucion (_VEHICULO_RE) -- mismo
 # criterio que _referencia_trading_con_vehiculo, para no bloquear un
 # mensaje de commit en prosa que mencione ambos patrones sin ejecutar
