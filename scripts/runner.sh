@@ -173,7 +173,13 @@ set +e
 PRE_RUN_PEAK="$(/usr/bin/python3 scripts/integrity_check.py --print-peak)"
 set -e
 
-"$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
+# caffeinate -i: impide que la Mac entre en sleep por inactividad mientras la
+# corrida esta en curso (abort del 2026-08-20: la Mac se durmio a mitad de
+# sesion y la conexion con la API murio). Best-effort: si caffeinate no
+# existe, se invoca claude directo.
+CAFFEINATE=""
+command -v caffeinate >/dev/null 2>&1 && CAFFEINATE="caffeinate -i"
+$CAFFEINATE "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
   --allowedTools "Bash,Read,Write,Glob,Grep" \
   --max-turns 60 \
   > "reports/${STAMP}-${MODE}.log" 2>&1 || {
